@@ -1,0 +1,18 @@
+{
+  "commit": "8acdf0402e59b9e08e138b8204f964766fa42388",
+  "state": "success",
+  "context": "external/tests",
+  "runner": "external Linux/WSL process",
+  "python": "3.12.3",
+  "started_at": "2026-10-28T12:57:05.631016+00:00",
+  "completed_at": "2026-10-28T12:57:09.687597+00:00",
+  "compile_exit_code": 0,
+  "test_exit_code": 0,
+  "summary": {
+    "tests_run": 57,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": true
+  }
+}
