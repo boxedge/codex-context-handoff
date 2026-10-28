@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.local/
+.env
+.env.*
+!.env.example
+*.log
+*.kubeconfig
+.DS_Store
