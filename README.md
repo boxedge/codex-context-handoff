@@ -3,7 +3,7 @@
 Continue a long-running Codex task in a fresh chat, with a small verified
 checkpoint, the same workspace, numbered titles, and links back to its history.
 
-[![Tests](https://github.com/boxedge/codex-context-handoff/actions/workflows/tests.yml/badge.svg)](https://github.com/boxedge/codex-context-handoff/actions/workflows/tests.yml)
+[![External tests (WSL)](https://img.shields.io/github/checks-status/boxedge/codex-context-handoff/main?label=External%20tests%20%28WSL%29)](https://github.com/boxedge/codex-context-handoff/tree/test-results)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **Experimental community integration for Linux/WSL.** Fully automatic mode
@@ -247,7 +247,30 @@ process or retained hook references them. Nothing prunes history automatically.
 The test suite uses temporary workspaces and recording transports; no Codex
 login or real model calls are required. It includes a detached-process crash
 drill: the first worker exits hard, the second sends once, and replay sends
-nothing further. CI runs on Linux with Python 3.11–3.13.
+nothing further. The GitHub Actions workflow defines a Python 3.11–3.13 matrix;
+its hosted runs are currently unavailable. The badge instead shows the latest
+commit status published by the external Linux/WSL test runner.
+
+Run the committed `HEAD` in a clean temporary checkout outside GitHub Actions:
+
+```bash
+python3 scripts/run_external_tests.py
+```
+
+To publish the result, push the source commit first, authenticate `gh` with write
+access to this repository, then run:
+
+```bash
+python3 scripts/run_external_tests.py --publish
+```
+
+This publishes the `external/tests` status for the exact tested commit, with a
+link to a sanitized report and test log on the `test-results` branch. The badge
+uses the status of current `main`; a new untested commit does not inherit an
+older success. Reports identify the actual Python version used. This is a
+manually invoked external check, not an automatic service or a claim that the
+whole Python matrix or live Desktop rollover passed. No billing change is needed.
+Only publish logs from trusted tests after reviewing them for sensitive data.
 
 Earlier real 350k/400k Desktop rollover acceptance was performed in the
 originating environment. The latest resilience path has automated crash tests,
