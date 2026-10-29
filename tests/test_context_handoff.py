@@ -111,7 +111,7 @@ class HandoffTests(unittest.TestCase):
         FakeServer.title = 'Continue: a deliberate custom title · 12345678'
         self.transcript_at(400000);m.hook(self.payload,self.root);self.checkpoint()
         result = m.ready(self.root,self.sid,FakeServer)
-        self.assertEqual(result['successor_title'], FakeServer.title + ' · Part 2')
+        self.assertEqual(result['successor_title'], 'Part 2 · ' + FakeServer.title)
         successor = m.load_json(self.root/'sessions/successor-1/state.json')
         self.assertEqual((successor['root_thread_id'], successor['previous_thread_id'], successor['part']),
                          (self.sid, self.sid, 2))
@@ -578,7 +578,7 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual([name for name,_ in FakeDesktop.calls],
                          ['connect','set_thread_title','navigate_to_codex_page','send_message_to_thread'])
         self.assertEqual(FakeDesktop.calls[1][1], {'threadId':self.sid,'source':'codex',
-                         'title':self.cwd.name + ' · Part 1'})
+                         'title':'Part 1 · ' + self.cwd.name})
         args=FakeDesktop.calls[-1][1]
         self.assertEqual(args['threadId'],'successor-1')
         self.assertNotIn('model',args);self.assertNotIn('thinking',args)

@@ -23,7 +23,7 @@ continuation.
   next action exactly before accepting the handoff.
 - In automatic Desktop mode, waits for the source Stop event, then submits the
   continuation through Desktop so progress and controls stay in the app.
-- Uses titles such as `Improve CI reliability · Part 1`, `· Part 2`, `· Part 3`.
+- Uses titles such as `Part 1 · Improve CI reliability`, `Part 2 · Improve CI reliability`.
   Successor prompts link to the **Original chat** and **Previous part**.
 - Preserves the original chat, transcript, dirty files, credentials, and Git
   history. It does not commit, push, stash, reset, or move your workspace.

@@ -64,8 +64,8 @@ Desktop-owned turn that has already been accepted.
 This integration does not promise identical recall of every old message.
 Original history is retained for selective recovery.
 
-Successors retain the original task title with ` · Part 2`, ` · Part 3`, and so
-on. Desktop labels the original chat ` · Part 1` at its first automatic
+Successors prefix the original task title with `Part 2 · `, `Part 3 · `, and so
+on. Desktop prefixes the original chat with `Part 1 · ` at its first automatic
 handoff. Private state stores the original title, root chat, part number and
 previous chat; ancestry comes from recorded handoff edges, never title parsing.
 Both initialization and continuation prompts begin with clickable **Original

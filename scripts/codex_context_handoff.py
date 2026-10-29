@@ -344,7 +344,7 @@ def lineage_for(root, sid, read_thread):
 
 
 def lineage_title(lineage):
-    return lineage['root_title'] + ' · Part ' + str(lineage['part'])
+    return 'Part ' + str(lineage['part']) + ' · ' + lineage['root_title']
 
 
 def lineage_header(lineage):
