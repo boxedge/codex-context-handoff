@@ -1,0 +1,18 @@
+{
+  "commit": "ca3021afc231c323e1220197804d6844c6807000",
+  "state": "success",
+  "context": "external/tests",
+  "runner": "external Linux/WSL process",
+  "python": "3.12.3",
+  "started_at": "2026-10-29T15:13:24.024363+00:00",
+  "completed_at": "2026-10-29T15:13:28.856375+00:00",
+  "compile_exit_code": 0,
+  "test_exit_code": 0,
+  "summary": {
+    "tests_run": 79,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": true
+  }
+}
