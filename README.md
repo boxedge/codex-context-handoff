@@ -197,7 +197,8 @@ the helper does not independently evaluate their truth or replace task review.
 
 A task-owned monitor reads native Desktop status, never an idle-time heuristic.
 It retries only a terminal **failed** turn with a confirmed capacity/overload
-error while the thread is idle. It waits 30, 60, 120, 240, then 300 seconds, plus
+error while the thread is `idle` or `systemError`, with no active approval flags.
+A system error alone never permits a retry. It waits 30, 60, 120, 240, then 300 seconds, plus
 jitter, and honors explicit retry-after hints exposed by the error. It rereads
 task state, settings and live status before sending a continuation in the same
 chat. A successful tool callback resets the capacity-outage retry counter.

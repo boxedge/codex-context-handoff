@@ -141,6 +141,31 @@ class TaskRecoveryTests(unittest.TestCase):
         self.assertIn('reference data',sends[0]['prompt'])
         self.assertEqual(h.load_json(self.directory/'task-control.json')['capacity_attempts'],1)
 
+    def test_native_system_error_capacity_failure_retries_once(self):
+        # Native read_thread reports provider-failed threads as systemError.
+        snapshot = self.snapshot(thread_status='systemError', error={
+            'message': 'Selected model is at capacity. Please try a different model.',
+            'additionalDetails': None})
+        snapshot['thread']['status'].pop('activeFlags')
+        desktop,calls = self.desktop([snapshot])
+        h.watch_task(self.root,self.sid,desktop_factory=desktop,sleeper=lambda _:None,max_polls=2)
+        self.assertEqual(sum(name=='send_message_to_thread' for name,_ in calls),1)
+        self.assertEqual(h.load_json(self.directory/'task-control.json')['capacity_attempts'],1)
+
+    def test_system_error_still_requires_terminal_capacity_failure_without_approval(self):
+        snapshots = [self.snapshot(thread_status='systemError',status=status)
+                     for status in ('inProgress','completed','interrupted')]
+        snapshots += [self.snapshot(thread_status='systemError',error={'message': message})
+                      for message in ('Quota exceeded','Unauthorized','Context window exceeded','Unknown error')]
+        waiting = self.snapshot(thread_status='systemError')
+        waiting['thread']['status']['activeFlags'] = ['waitingOnApproval']
+        snapshots.append(waiting)
+        snapshots.append(self.snapshot(thread_status='unrecognized'))
+        for snapshot in snapshots:
+            with self.subTest(snapshot=snapshot):
+                self.assertNotEqual(h.recovery_decision(self.task,self.control,self.state,
+                                                       snapshot,self.config,0),'retry_capacity')
+
     def test_capacity_limit_exhaustion_stops_without_a_send(self):
         h.atomic_json(self.directory/'task-control.json',dict(self.control,capacity_attempts=5))
         desktop,calls=self.desktop([self.snapshot()])

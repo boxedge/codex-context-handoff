@@ -196,7 +196,8 @@ send intent. Do not edit control markers to force a retry of an uncertain send.
 Native `read_thread` supplies live status and newest-first turns. A separate
 app-server read can reflect persisted history instead of current Desktop
 activity and must not be used to decide that a task is idle. Capacity recovery
-requires both native idle status and an explicit failed capacity/overload error.
+requires native `idle` or `systemError` status, no active approval flags, and an
+explicit failed capacity/overload error. A system error alone never permits a retry.
 An interrupted turn is always left for the user. Work is not retried merely
 because no output arrived for a while. There is no provider/model failover.
 

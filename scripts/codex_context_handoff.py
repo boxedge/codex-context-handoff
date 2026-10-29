@@ -525,7 +525,9 @@ def recovery_decision(task, control, state, snapshot, config, now):
     status = thread.get('status', {})
     if status.get('type') == 'active' or status.get('activeFlags'):
         return 'running_or_waiting_for_input'
-    if status.get('type') != 'idle' or not snapshot.get('turns'):
+    # Native Desktop leaves provider-failed threads in systemError, not idle.
+    # The terminal turn and explicit capacity error below remain required.
+    if status.get('type') not in ('idle', 'systemError') or not snapshot.get('turns'):
         return 'unknown_status'
     turn = snapshot['turns'][0]  # read_thread explicitly returns newest first.
     if turn.get('status') == 'interrupted':
