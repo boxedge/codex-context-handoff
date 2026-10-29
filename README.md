@@ -52,6 +52,8 @@ Required lifecycle events: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`,
 Automatic Desktop mode also requires `send_message_to_thread`,
 `navigate_to_codex_page` when auto-open is enabled, and `set_thread_title` for
 the original title. Bundled Desktop tools can change independently of the CLI.
+Optional task recovery additionally requires native `read_thread` with live
+thread status and structured turn errors.
 
 The originating environment used `codex-cli 0.165.0-alpha.1.2` with Python
 3.12 on WSL. Compatibility is capability-based; this version is an observation,
@@ -166,6 +168,67 @@ identity to force a connection. Missing Desktop tools produce a recorded failure
 the helper does not silently switch to an externally owned worker.
 
 ## Resilience and safety
+
+### Optional recovery for capacity errors and premature finishes
+
+Enable this separately from context handoff by merging the following object
+into the private `settings.json` created by the installer:
+
+```json
+"task_recovery": {
+  "enabled": true,
+  "capacity_limit": 5,
+  "capacity_delay": 30,
+  "premature_limit": 3,
+  "poll_seconds": 15
+}
+```
+
+For multi-step tasks, hooks ask the agent to keep a private task ledger from the
+start. It records the **whole original goal**, constraints, remaining work,
+acceptance criteria and evidence. A normal Stop while that ledger is active
+requests continuation. An intermediate test, PR or checkpoint is not completion.
+Within the same user request, the original goal cannot be replaced and existing
+constraints or acceptance criteria cannot be removed by a milestone update.
+Three stops without recorded progress pause the guard and surface a warning.
+To mark a task complete, every acceptance criterion needs recorded evidence and
+the remaining-work list must be empty. Evidence references are recorded claims;
+the helper does not independently evaluate their truth or replace task review.
+
+A task-owned monitor reads native Desktop status, never an idle-time heuristic.
+It retries only a terminal **failed** turn with a confirmed capacity/overload
+error while the thread is idle. It waits 30, 60, 120, 240, then 300 seconds, plus
+jitter, and honors explicit retry-after hints exposed by the error. It rereads
+task state, settings and live status before sending a continuation in the same
+chat. A successful tool callback resets the capacity-outage retry counter.
+
+Manual or unknown interruptions, pending approvals, genuine new user input,
+quota/authentication/context-limit errors and uncertain sends are not replayed.
+Existing jobs and receipts must be reconciled before the agent takes further
+action. The model and permissions are unchanged. A disconnected observer stops
+without assuming work failed. The monitor never restarts Codex or WSL itself.
+
+This operates only on registered tasks. Simple questions need no ledger. Newly
+prepared handoffs carry their original goal and criteria; monitoring starts only
+after Desktop accepts continuation, never during read-only initialization.
+Otherwise the agent registers or updates a ledger like [examples/task.json](examples/task.json):
+
+```bash
+python3 scripts/codex_context_handoff.py task \
+  --session YOUR_CHAT_ID --file /path/to/private/task-input.json
+python3 scripts/codex_context_handoff.py task --session YOUR_CHAT_ID
+python3 scripts/codex_context_handoff.py task --session YOUR_CHAT_ID --pause
+```
+
+To resume, explicitly re-register the authorized task as active. Task files,
+control state and `task-watch.log` live in the private session directory and
+must not be committed. Each enrolled active task can retain one small monitor
+process; it exits on completion/pause, new input, handoff, an interruption or a
+terminal recovery condition. Cached hooks can adopt this code through the stable
+loader. This feature is disabled by default and should be qualified in your own
+Desktop build; the supplied fault tests use recording transports.
+
+### Context handoff recovery
 
 - Waiting for source Stop starts no worker and has **no 180-second expiry**.
   A delayed Stop can recover an older `source_stop_not_confirmed` outcome.

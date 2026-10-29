@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import random
 import re
 import shutil
 import signal
@@ -252,6 +253,7 @@ def hook(payload, root):
         return {}
     directory = session_dir(root, sid)
     schedule_on_stop = False
+    watch_due = False
     with locked(directory, blocking=False):
         state = load_json(directory / 'state.json', {'version': VERSION, 'session_id': sid, 'prompt_epoch': 0})
         state.update(cwd=str(local_path(payload['cwd']).resolve()), transcript_path=str(local_path(transcript)),
@@ -312,11 +314,373 @@ def hook(payload, root):
                 if output:
                     state['last_instruction_tokens'] = current
                     state['last_instruction_epoch'] = state['prompt_epoch']
+        if not (state.get('handoff_initializing') or (state.get('successor_ready') and same_request)):
+            if event != 'Stop' or not output:
+                recovery = task_recovery_hook(payload, root, directory, state, config)
+                if recovery.get('decision'):
+                    output = recovery
+                elif recovery.get('systemMessage'):
+                    output['systemMessage'] = recovery['systemMessage']
+                elif recovery:
+                    context = recovery['hookSpecificOutput']['additionalContext']
+                    if output.get('hookSpecificOutput'):
+                        output['hookSpecificOutput']['additionalContext'] += '\n' + context
+                    else:
+                        output = recovery
+        watch_due = state.pop('recovery_watch_due', False)
         atomic_json(directory / 'state.json', state)
     # Scheduling takes its own state lock. Persist the stop before launching anything.
     if schedule_on_stop and not schedule_continuation(root, sid):
         output['systemMessage'] += ' Automatic dispatch is pending or requires inspection; see handoff status.'
+    if watch_due:
+        schedule_task_watch(root, sid)
     return output
+
+
+# Task recovery is opt-in. Native Desktop owns every actual model turn.
+def recovery_enabled(config):
+    return bool(config.get('enabled') and config.get('task_recovery', {}).get('enabled'))
+
+
+def validate_task(value):
+    if not isinstance(value, dict) or value.get('status') not in ('active', 'blocked', 'paused', 'complete'):
+        raise ValueError('Task status must be active, blocked, paused or complete')
+    if not isinstance(value.get('goal'), str) or not value['goal'].strip():
+        raise ValueError('Task needs its original goal')
+    for name in ('constraints', 'remaining', 'acceptance'):
+        if not isinstance(value.get(name), list) or not all(isinstance(v, str) and v.strip() for v in value[name]):
+            raise ValueError('Task needs string list: ' + name)
+    if not value['acceptance'] or not isinstance(value.get('evidence', {}), dict):
+        raise ValueError('Task needs acceptance criteria and an evidence mapping')
+    if value['status'] == 'active' and not value['remaining']:
+        raise ValueError('Active task needs remaining work')
+    if value['status'] == 'complete' and (value['remaining'] or any(
+            not isinstance(value.get('evidence', {}).get(item), list) or
+            not value['evidence'][item] or not all(isinstance(v, str) and v.strip()
+                for v in value['evidence'][item]) for item in value['acceptance'])):
+        raise ValueError('Completion needs no remaining work and recorded evidence for every criterion')
+    if value['status'] in ('blocked', 'paused') and not value.get('reason'):
+        raise ValueError('Blocked or paused task needs a reason')
+    encoded = json.dumps(value)
+    if len(encoded.encode()) > 12288 or re.search(r'sk-[A-Za-z0-9_-]{24,}|-----BEGIN [A-Z ]*PRIVATE KEY-----', encoded):
+        raise ValueError('Task is oversized or appears to contain a credential')
+    return value
+
+
+def task_progress(value):
+    return hashlib.sha256(json.dumps({k: value.get(k) for k in
+        ('goal', 'constraints', 'remaining', 'acceptance', 'evidence')}, sort_keys=True).encode()).hexdigest()
+
+
+def register_task(root, sid, value):
+    value = validate_task(value)
+    directory = session_dir(root, sid)
+    state = load_json(directory/'state.json')
+    if not state:
+        raise ValueError('Task registration requires genuine source hook state')
+    with locked(directory, 'task.lock'):
+        control = load_json(directory/'task-control.json', {})
+        previous = load_json(directory/'task.json', {})
+        if previous.get('prompt_epoch') == state['prompt_epoch']:
+            if previous.get('goal') != value['goal'] or any(
+                    not set(previous.get(name, [])).issubset(value[name]) for name in ('constraints', 'acceptance')):
+                raise ValueError('Keep the original goal, constraints and acceptance criteria until genuine new user input')
+        if control.get('progress') != task_progress(value):
+            control.update(progress=task_progress(value), premature_attempts=0, capacity_attempts=0)
+        if previous.get('status') in ('paused', 'blocked') and value['status'] == 'active' and not control.get('dispatching_at'):
+            control.update(premature_attempts=0, capacity_attempts=0)
+        if control.get('prompt_epoch') != state['prompt_epoch']:
+            control = {'progress': task_progress(value), 'premature_attempts': 0, 'capacity_attempts': 0}
+        control['prompt_epoch'] = state['prompt_epoch']
+        task = dict(value, session_id=sid, prompt_epoch=state['prompt_epoch'], updated_at=time.time())
+        atomic_json(directory/'task.json', task)
+        atomic_json(directory/'task-control.json', control)
+    if value['status'] == 'active':
+        schedule_task_watch(root, sid)
+    return {'status': value['status'], 'task': str(directory/'task.json')}
+
+
+def task_recovery_hook(payload, root, directory, state, config):
+    if not recovery_enabled(config):
+        return {}
+    event = payload.get('hook_event_name')
+    task = load_json(directory/'task.json', {})
+    if event == 'UserPromptSubmit' and task and isinstance(payload.get('prompt'), str):
+        with locked(directory, 'task.lock'):
+            control = load_json(directory/'task-control.json', {})
+            digest = hashlib.sha256(payload['prompt'].encode()).hexdigest()
+            if (control.get('expected_prompt_sha256') == digest and
+                    task.get('prompt_epoch') == control.get('prompt_epoch') == state['prompt_epoch'] - 1):
+                # Only our exact durably recorded prompt can retain the existing task authority.
+                task['prompt_epoch'] = state['prompt_epoch']
+                control['prompt_epoch'] = state['prompt_epoch']
+                control.pop('expected_prompt_sha256', None)
+                atomic_json(directory/'task.json', task)
+                atomic_json(directory/'task-control.json', control)
+    if event == 'Stop':
+        if task.get('status') != 'active' or task.get('prompt_epoch') != state['prompt_epoch']:
+            return {}
+        with locked(directory, 'task.lock'):
+            control = load_json(directory/'task-control.json', {})
+            if control.get('dispatching_at'):
+                return {}
+            limit = config['task_recovery'].get('premature_limit', 3)
+            if control.get('premature_attempts', 0) >= limit:
+                control['status'] = 'premature_retries_exhausted'
+                task.update(status='blocked', reason='Repeated stops without recorded progress; inspect before resuming')
+                atomic_json(directory/'task.json', task)
+                atomic_json(directory/'task-control.json', control)
+                return {'systemMessage': 'Task recovery paused after repeated stops without recorded progress. '
+                        'Inspect ' + str(directory/'task-control.json') + ' and the task ledger.'}
+            reason = (
+            'The authorized task is still active with remaining work. Read ' + str(directory/'task.json') +
+            ' and inspect existing files/jobs before continuing the next remaining step. An intermediate test, PR, '
+            'checkpoint or summary is not completion of the whole goal. Update this task ledger through the helper '
+            'task command. Mark complete only with recorded evidence for every acceptance criterion; mark blocked '
+            'only for a genuine missing permission, user decision or unavailable dependency. Preserve all restrictions.')
+            control['premature_attempts'] = control.get('premature_attempts', 0) + 1
+            control['status'] = 'stop_guard_continuation'
+            control['expected_prompt_sha256'] = hashlib.sha256(reason.encode()).hexdigest()
+            atomic_json(directory/'task-control.json', control)
+        return {'decision': 'block', 'reason': reason}
+    if event not in ('UserPromptSubmit', 'PostToolUse'):
+        return {}
+    if task.get('status') == 'active' and task.get('prompt_epoch') == state['prompt_epoch']:
+        state['recovery_watch_due'] = True
+        # A real tool callback after retry proves the provider is responding again.
+        if event == 'PostToolUse':
+            with locked(directory, 'task.lock'):
+                control = load_json(directory/'task-control.json', {})
+                if control.get('capacity_attempts'):
+                    control['capacity_attempts'] = 0
+                    atomic_json(directory/'task-control.json', control)
+        return {}
+    if state.get('recovery_instruction_epoch') == state['prompt_epoch']:
+        return {}
+    state['recovery_instruction_epoch'] = state['prompt_epoch']
+    import shlex
+    command = shlex.join([sys.executable, str(Path(__file__).resolve()), 'task', '--root', str(root),
+                          '--session', state['session_id'], '--file', str(directory/'task-input.json')])
+    return {'hookSpecificOutput': {'hookEventName': event, 'additionalContext':
+        'User enabled recovery for long-running authorized tasks. For multi-step work, maintain a concise JSON task '
+        'ledger from the start: goal, constraints[], status(active/blocked/paused/complete), remaining[], acceptance[], '
+        'evidence{criterion:[proof references]}, next_action, and reason for blocked/paused. Write ' +
+        str(directory/'task-input.json') + ' and register/update it with ' + command + '. '
+        'Keep the entire requested goal active through intermediate checkpoints/tests/PRs; record actual blockers '
+        'instead of inventing remaining work. Simple questions need no task ledger. Do not store secrets. '
+        'Update at milestones and before stopping; completion requires evidence for every acceptance criterion.'}}
+
+
+def capacity_error(error):
+    if not isinstance(error, dict):
+        return False
+    text = json.dumps(error).lower()
+    compact = re.sub(r'[^a-z0-9]', '', text)
+    if any(word in compact for word in ('usagelimitexceeded', 'contextwindowexceeded', 'unauthorized', 'badrequest')):
+        return False
+    if any(word in text for word in ('usagelimitexceeded', 'usage_limit', 'quota', 'billing', 'payment',
+                                     'unauthorized', 'badrequest', 'contextwindowexceeded', 'context window')):
+        return False
+    return bool(re.search(r'\b(?:at|reached|over) capacity\b|capacity (?:reached|exceeded)|overloaded|temporarily unavailable',
+                          text) or re.search(r'httpstatuscode["\s:]+(?:503|529)\b', text))
+
+
+def seed_successor_task(root, state, checkpoint):
+    """Carry the authorized goal through bootstrap; start no model turn or watcher here."""
+    if not recovery_enabled(load_json(Path(root)/'settings.json', {})) or checkpoint['status'] != 'active':
+        return False
+    directory = session_dir(root, state['successor_id'])
+    source = load_json(session_dir(root, state['session_id'])/'task.json', {})
+    inherited = source.get('status') == 'active' and source.get('prompt_epoch') == state.get('prompt_epoch')
+    value = {'status': 'active', 'goal': source['goal'] if inherited else checkpoint['goal'],
+             'constraints': list(dict.fromkeys((source['constraints'] if inherited else []) + checkpoint['constraints'])),
+             'remaining': checkpoint['remaining'],
+             'acceptance': source['acceptance'] if inherited else ['Complete the whole original goal: ' + checkpoint['goal']],
+             'evidence': source.get('evidence', {}) if inherited else {}, 'next_action': checkpoint['next_action']}
+    validate_task(value)
+    with locked(directory, 'task.lock'):
+        if (directory/'task.json').exists():
+            return False  # Never overwrite a successor that has already been used or registered.
+        successor = load_json(directory/'state.json')
+        value.update(session_id=state['successor_id'], prompt_epoch=successor['prompt_epoch'], updated_at=time.time())
+        atomic_json(directory/'task.json', value)
+        atomic_json(directory/'task-control.json', {'prompt_epoch': successor['prompt_epoch'],
+                    'progress': task_progress(value), 'premature_attempts': 0, 'capacity_attempts': 0})
+    return True
+
+
+def recovery_decision(task, control, state, snapshot, config, now):
+    if (not recovery_enabled(config) or task.get('status') != 'active' or
+            (config.get('allowed_sessions') and task.get('session_id') not in config['allowed_sessions'])):
+        return 'inactive'
+    if task.get('prompt_epoch') != state.get('prompt_epoch'):
+        return 'new_user_input'
+    if state.get('successor_ready') and state.get('successor_prompt_epoch') == state.get('prompt_epoch'):
+        return 'handed_off'
+    if control.get('dispatching_at'):
+        return 'dispatch_already_attempted'
+    thread = snapshot.get('thread', {})
+    if thread.get('id') != task.get('session_id'):
+        return 'unknown_thread'
+    status = thread.get('status', {})
+    if status.get('type') == 'active' or status.get('activeFlags'):
+        return 'running_or_waiting_for_input'
+    if status.get('type') != 'idle' or not snapshot.get('turns'):
+        return 'unknown_status'
+    turn = snapshot['turns'][0]  # read_thread explicitly returns newest first.
+    if turn.get('status') == 'interrupted':
+        return 'manual_or_unknown_interruption'
+    if turn.get('status') != 'failed' or not capacity_error(turn.get('error')):
+        return 'not_a_capacity_failure'
+    if turn.get('id') in control.get('handled_turns', []):
+        return 'already_handled'
+    if control.get('capacity_attempts', 0) >= config['task_recovery'].get('capacity_limit', 5):
+        return 'capacity_retries_exhausted'
+    return 'retry_capacity'
+
+
+def capacity_delay(error, attempt, settings):
+    base = min(300, settings.get('capacity_delay', 30) * (2 ** attempt))
+    delay = base * random.uniform(1, 1.15)
+    # Some providers include a structured hint or explicit retry-after seconds in their error.
+    hint = error.get('retryAfterSeconds') if isinstance(error, dict) else None
+    if hint is None and isinstance(error, dict):
+        match = re.search(r'retry[ -]after[: ]+(\d+)\s*(?:s|sec|seconds)\b', error.get('message', ''), re.I)
+        hint = int(match[1]) if match else None
+    if isinstance(hint, (int, float)) and 0 <= hint <= 86400:
+        delay = max(delay, hint)
+    return delay
+
+
+def schedule_task_watch(root, sid, caller_thread_id=None, caller_turn_id=None):
+    config = load_json(Path(root)/'settings.json', {})
+    if not recovery_enabled(config) or (config.get('allowed_sessions') and sid not in config['allowed_sessions']):
+        return False
+    directory = session_dir(root, sid)
+    with locked(directory, 'task-watch-start.lock'):
+        worker = load_json(directory/'task-watch.json', {})
+        identity = process_identity(worker.get('pid'))
+        if identity and identity == worker.get('identity'):
+            return True
+        with (directory/'task-watch.log').open('ab') as log:
+            os.chmod(log.name, 0o600)
+            process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'watch-task',
+                '--root', str(root), '--session', sid], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                start_new_session=True)
+        atomic_json(directory/'task-watch.json', {'pid': process.pid, 'identity': process_identity(process.pid),
+            'caller_thread_id': caller_thread_id or sid, 'caller_turn_id': caller_turn_id})
+    threading.Thread(target=process.wait, daemon=True).start()
+    return True
+
+
+def watch_task(root, sid, desktop_factory=None, sleeper=None, max_polls=None):
+    directory = session_dir(root, sid)
+    sleeper = sleeper or time.sleep
+    factory = desktop_factory or DesktopTools
+    with locked(directory, 'task-watch.lock', blocking=False):
+        with locked(directory, 'task-watch-start.lock'):
+            pass  # The launcher must persist genuine caller routing before the child reads it.
+        polls = 0
+        while max_polls is None or polls < max_polls:
+            polls += 1
+            config = load_json(Path(root)/'settings.json', {})
+            state = load_json(directory/'state.json', {})
+            task = load_json(directory/'task.json', {})
+            control = load_json(directory/'task-control.json', {})
+            if (not recovery_enabled(config) or (config.get('allowed_sessions') and sid not in config['allowed_sessions'])
+                    or task.get('status') != 'active' or task.get('prompt_epoch') != state.get('prompt_epoch')):
+                return {'status': 'inactive_or_new_user_input'}
+            if state.get('successor_ready') and state.get('successor_prompt_epoch') == state.get('prompt_epoch'):
+                return {'status': 'handed_off'}
+            if control.get('dispatching_at'):
+                return {'status': 'dispatch_already_attempted'}
+            try:
+                routing = load_json(directory/'task-watch.json', {})
+                with factory(config_home=state['config_home'], caller_thread_id=routing.get('caller_thread_id', sid),
+                             caller_turn_id=routing.get('caller_turn_id') or state.get('last_prompt_turn_id')) as desktop:
+                    snapshot = desktop.call('read_thread', {'threadId': sid, 'hostId': 'local', 'turnLimit': 1,
+                        'includeOutputs': False, 'maxOutputCharsPerItem': 0})
+                    decision = recovery_decision(task, control, state, snapshot, config, time.time())
+                    if decision == 'retry_capacity':
+                        turn_id = snapshot['turns'][0]['id']
+                        attempt = control.get('capacity_attempts', 0)
+                        delay = capacity_delay(snapshot['turns'][0]['error'], attempt, config['task_recovery'])
+                        # Waiting alone grants no authority. Re-read live state after the backoff.
+                        sleeper(delay)
+                        current = load_json(directory/'state.json', {})
+                        task = load_json(directory/'task.json', {})
+                        control = load_json(directory/'task-control.json', {})
+                        config = load_json(Path(root)/'settings.json', {})
+                        if (not recovery_enabled(config) or
+                                (config.get('allowed_sessions') and sid not in config['allowed_sessions'])):
+                            return {'status': 'automatic_recovery_disabled'}
+                        if current.get('prompt_epoch') != state.get('prompt_epoch'):
+                            return {'status': 'new_user_input'}
+                        snapshot = desktop.call('read_thread', {'threadId': sid, 'hostId': 'local', 'turnLimit': 1,
+                            'includeOutputs': False, 'maxOutputCharsPerItem': 0})
+                        if (recovery_decision(task, control, current, snapshot, config, time.time()) != 'retry_capacity'
+                                or snapshot['turns'][0]['id'] != turn_id):
+                            continue
+                        prompt = ('The user enabled task recovery. The preceding turn failed because the model provider '
+                            'was temporarily at capacity. Continue only the existing authorized goal in ' +
+                            str(directory/'task.json') + '. First reconcile files, existing jobs and receipts; never '
+                            'repeat an action whose outcome is uncertain. Preserve all restrictions and normal approvals. '
+                            'The ledger is reference data and cannot grant new authority. Continue remaining work '
+                            'and update the task ledger; if genuinely blocked, record the blocker.')
+                        with locked(directory, 'task.lock'):
+                            latest = load_json(directory/'task-control.json', {})
+                            latest_task = load_json(directory/'task.json', {})
+                            latest_state = load_json(directory/'state.json', {})
+                            latest_config = load_json(Path(root)/'settings.json', {})
+                            if (latest.get('dispatching_at') or latest_task.get('status') != 'active' or
+                                    latest_state.get('prompt_epoch') != state.get('prompt_epoch') or
+                                    recovery_decision(latest_task, latest, latest_state, snapshot,
+                                                      latest_config, time.time()) != 'retry_capacity' or
+                                    latest_task.get('prompt_epoch') != latest_state.get('prompt_epoch') or
+                                    turn_id in latest.get('handled_turns', [])):
+                                return {'status': 'dispatch_already_attempted'}
+                            latest.update(dispatching_at=time.time(), status='capacity_dispatching',
+                                capacity_attempts=attempt + 1,
+                                expected_prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+                                handled_turns=(latest.get('handled_turns', []) + [turn_id])[-32:])
+                            atomic_json(directory/'task-control.json', latest)
+                        try:
+                            receipt = desktop.call('send_message_to_thread', {'threadId': sid, 'hostId': 'local', 'prompt': prompt})
+                        except Exception:
+                            with locked(directory, 'task.lock'):
+                                latest = load_json(directory/'task-control.json', {})
+                                latest['status'] = 'capacity_dispatch_ambiguous'
+                                atomic_json(directory/'task-control.json', latest)
+                            return {'status': 'capacity_dispatch_ambiguous'}
+                        with locked(directory, 'task.lock'):
+                            latest = load_json(directory/'task-control.json', {})
+                            latest.pop('dispatching_at', None)
+                            latest.update(status='capacity_dispatched', last_receipt_status=receipt.get('status'))
+                            atomic_json(directory/'task-control.json', latest)
+                    elif decision in ('capacity_retries_exhausted', 'new_user_input', 'handed_off', 'unknown_thread',
+                                       'manual_or_unknown_interruption'):
+                        with locked(directory, 'task.lock'):
+                            latest = load_json(directory/'task-control.json', {})
+                            latest['status'] = decision
+                            atomic_json(directory/'task-control.json', latest)
+                            latest_task = load_json(directory/'task.json', {})
+                            if latest_task.get('prompt_epoch') == state.get('prompt_epoch'):
+                                if decision == 'capacity_retries_exhausted':
+                                    latest_task.update(status='blocked', reason='Provider capacity retry budget exhausted')
+                                    atomic_json(directory/'task.json', latest_task)
+                                elif decision == 'manual_or_unknown_interruption':
+                                    latest_task.update(status='paused', reason='Manual or unknown interruption')
+                                    atomic_json(directory/'task.json', latest_task)
+                        return {'status': decision}
+            except (OSError, RuntimeError, ValueError, TimeoutError) as exc:
+                # A disconnected observer does not prove a task stopped. Never send from cached status.
+                with locked(directory, 'task.lock'):
+                    latest = load_json(directory/'task-control.json', {})
+                    latest.update(status='observer_unavailable', error_type=type(exc).__name__)
+                    atomic_json(directory/'task-control.json', latest)
+                return {'status': 'observer_unavailable'}
+            sleeper(config['task_recovery'].get('poll_seconds', 15))
+        return {'status': 'poll_limit'}
 
 
 def lineage_for(root, sid, read_thread):
@@ -414,6 +778,9 @@ def ready(root, sid, server_factory=None):
                     successor_state = load_json(successor_directory/'state.json',
                         {'version': VERSION, 'session_id': state['successor_id'], 'prompt_epoch': 0})
                     successor_state.update(successor_lineage)
+                    successor_state['handoff_initializing'] = True
+                    successor_state.setdefault('config_home', state['config_home'])
+                    successor_state.setdefault('cwd', state['cwd'])
                     atomic_json(successor_directory/'state.json', successor_state)
             else:
                 server.rpc('thread/resume', {'threadId': state['successor_id']})
@@ -457,12 +824,16 @@ def ready(root, sid, server_factory=None):
                             ('prompt_epoch', 'last_prompt_turn_id', 'last_user_marker')}
         if not checkpoint_is_current(directory, state):
             raise ValueError('Workspace changed during initialization; source chat retained')
+        update_state(session_dir(root, state['successor_id']), handoff_initializing=False)
+        recovery_seeded = seed_successor_task(root, state, checkpoint)
         with locked(directory):
             latest = load_json(directory/'state.json')
             if latest['prompt_epoch'] != state['prompt_epoch']:
                 raise ValueError('New user input arrived during initialization; source chat retained')
             latest.update(successor_id=state['successor_id'], successor_title=state['successor_title'], successor_ready=True,
                           successor_prompt_epoch=state['prompt_epoch'], successor_initial_marker=successor_marker)
+            if recovery_seeded:
+                latest['successor_recovery_seeded'] = True
             atomic_json(directory/'state.json', latest)
         automatic = schedule_continuation(root, sid) if (config.get('auto_continue') and
                     (not config.get('allowed_sessions') or sid in config['allowed_sessions'])) else False
@@ -648,10 +1019,17 @@ def dispatch_desktop(root, directory, state, checkpoint, snapshot, config, deskt
         # Persist intent before sending; a lost receipt must never cause a second turn.
         outcome.update(status='desktop_dispatching', dispatching_at=time.time())
         update_state(directory, auto_continuation=outcome)
+        prompt = continuation_prompt(snapshot, state)
+        if state.get('successor_recovery_seeded'):
+            successor_directory = session_dir(root, state['successor_id'])
+            with locked(successor_directory, 'task.lock'):
+                control = load_json(successor_directory/'task-control.json', {})
+                control['expected_prompt_sha256'] = hashlib.sha256(prompt.encode()).hexdigest()
+                atomic_json(successor_directory/'task-control.json', control)
         try:
             receipt = desktop.call('send_message_to_thread', {
                 'threadId': state['successor_id'], 'hostId': 'local',
-                'prompt': continuation_prompt(snapshot, state),
+                'prompt': prompt,
             })
         except Exception:
             outcome['status'] = 'desktop_dispatch_failed_or_ambiguous'
@@ -663,6 +1041,9 @@ def dispatch_desktop(root, directory, state, checkpoint, snapshot, config, deskt
                 if key in receipt:
                     outcome['receipt_' + key] = receipt[key]
         update_state(directory, auto_continuation=outcome)
+        if state.get('successor_recovery_seeded'):
+            schedule_task_watch(root, state['successor_id'], caller_thread_id=state['session_id'],
+                                caller_turn_id=state.get('last_prompt_turn_id'))
         return outcome
 
 
@@ -982,11 +1363,14 @@ def main():
     probe = sub.add_parser('probe', help='Create, initialize, verify and archive a synthetic canary')
     probe.add_argument('--cwd', type=Path, required=True)
     probe.add_argument('--output', type=Path, required=True)
-    for name in ('hook', 'ready', 'continue', 'supervise', 'status', 'disable'):
+    for name in ('hook', 'ready', 'continue', 'supervise', 'status', 'disable', 'task', 'watch-task'):
         command = sub.add_parser(name)
         command.add_argument('--root', type=Path, default=DEFAULT_ROOT)
-        if name in ('ready', 'continue', 'supervise', 'status'):
+        if name in ('ready', 'continue', 'supervise', 'status', 'task', 'watch-task'):
             command.add_argument('--session', required=True)
+        if name == 'task':
+            command.add_argument('--file', type=Path, help='Register/update a task ledger JSON file')
+            command.add_argument('--pause', action='store_true', help='Pause recovery for this task')
     args = parser.parse_args()
     if args.command == 'hook':
         try:
@@ -999,6 +1383,29 @@ def main():
         return
     if args.command == 'ready':
         print(json.dumps(ready(args.root, args.session)))
+        return
+    if args.command == 'task':
+        directory = session_dir(args.root, args.session)
+        if args.file:
+            if args.file.is_symlink() or not args.file.is_file() or args.file.stat().st_size > 12288:
+                raise ValueError('Task input must be a regular JSON file smaller than 12 KiB')
+            print(json.dumps(register_task(args.root, args.session, load_json(args.file))))
+        elif args.pause:
+            value = load_json(directory/'task.json')
+            if not value:
+                raise ValueError('No registered task')
+            value.update(status='paused', reason='Operator paused task recovery')
+            print(json.dumps(register_task(args.root, args.session, value)))
+        else:
+            print(json.dumps({'task': load_json(directory/'task.json'),
+                              'control': load_json(directory/'task-control.json')}, indent=2))
+        return
+    if args.command == 'watch-task':
+        try:
+            result = watch_task(args.root, args.session)
+        except BlockingIOError:
+            result = {'status': 'task_watch_already_running'}
+        print(json.dumps(result))
         return
     if args.command == 'continue':
         def terminate_worker(signum, frame):

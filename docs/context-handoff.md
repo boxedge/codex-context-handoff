@@ -186,6 +186,27 @@ properties. Use only task-owned synthetic chats for that test.
 
 ## Troubleshooting
 
+Optional task recovery is independent of the 350k/400k thresholds. The
+`task_recovery` settings and `task`/`watch-task` commands are documented in the
+README. It requires a registered active task; absence of a ledger is not proof
+that an ordinary answer is unfinished. `task.json` contains goal and acceptance
+state; `task-control.json` contains retry counters, handled turn IDs and durable
+send intent. Do not edit control markers to force a retry of an uncertain send.
+
+Native `read_thread` supplies live status and newest-first turns. A separate
+app-server read can reflect persisted history instead of current Desktop
+activity and must not be used to decide that a task is idle. Capacity recovery
+requires both native idle status and an explicit failed capacity/overload error.
+An interrupted turn is always left for the user. Work is not retried merely
+because no output arrived for a while. There is no provider/model failover.
+
+The Stop guard tracks its exact generated continuation prompt so its synthetic
+user prompt can retain task ownership across epochs. Any other new user prompt
+cancels the old recovery authority until the agent registers the current task.
+An immutable dispatch marker prevents replay after a missing receipt or process
+crash. A handoff seeds the successor ledger after initialization, but starts its
+monitor only after native dispatch acceptance. Initial bootstrap stays read-only.
+
 | Symptom or state | Meaning and next step |
 | --- | --- |
 | Hooks never run | Confirm the selected home is the one Codex loads, all five definitions are trusted, and this chat loaded them. Reload only when existing work permits. |
@@ -201,6 +222,12 @@ properties. Use only task-owned synthetic chats for that test.
 | `checkpoint_changed` | Files, workspace identity or checkpoint changed since acceptance. Refresh through the source; do not edit the immutable snapshot to bypass validation. |
 | `desktop_dispatch_failed_or_ambiguous` | A send may already have been accepted. Check the successor in Desktop before any manual continuation. The supervisor will not retry it. |
 | `desktop_dispatched` | Desktop accepted the send. Inspect the successor's actual progress and completion in the app. |
+| `capacity_dispatched` | Desktop accepted a capacity-recovery follow-up; inspect actual progress. This is not task completion. |
+| `capacity_retries_exhausted` | Five capacity retries failed without a successful tool callback. Inspect provider availability and task state before explicitly resuming. |
+| `premature_retries_exhausted` | Repeated normal Stops made no recorded task progress. The Stop guard pauses with a warning instead of looping forever. |
+| `manual_or_unknown_interruption` | Native latest turn was interrupted. The monitor exits without restarting it. |
+| `capacity_dispatch_ambiguous` | A capacity follow-up may already have started. The marker stays non-retryable; reconcile the chat before any manual resend. |
+| `observer_unavailable` | Native status could not be read reliably. No cached-state retry is sent. The log/control file records an error type. |
 
 State and logs are private operational data. Redact paths, task text, IDs and
 IPC details before reporting bugs. Configuration backups can contain sensitive

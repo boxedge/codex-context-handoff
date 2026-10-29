@@ -1,0 +1,9 @@
+{
+  "goal": "Implement the parser fix and verify the requested end-to-end behavior.",
+  "constraints": ["Preserve unrelated edits; do not deploy."],
+  "status": "active",
+  "remaining": ["Fix the parser", "Run the focused regression and integration tests"],
+  "acceptance": ["The parser handles the reported input", "Regression and integration checks pass"],
+  "evidence": {},
+  "next_action": "Inspect the existing parser and regression fixture"
+}
