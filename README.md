@@ -167,6 +167,55 @@ An ordinary terminal may not have it. Do not fabricate a pipe path or thread
 identity to force a connection. Missing Desktop tools produce a recorded failure;
 the helper does not silently switch to an externally owned worker.
 
+## Durable local queue
+
+Use `python3 scripts/install_codex_context_handoff.py --enable-queue` to install
+the SQLite-backed queue and the owned systemd user service
+`codex-context-handoff-queue.service`. Python's standard SQLite module is the
+only database dependency. The private database is
+`~/.local/share/codex-context-handoff/queue.sqlite3`, on the local Linux filesystem.
+The existing JSON checkpoints, task ledgers and dispatch intents remain intact.
+
+Jobs have a unique kind/session/request-epoch identity, transactional claims,
+expiring worker leases, lease heartbeats, persisted retry deadlines and visible
+outcomes. The database uses WAL and full synchronization; only one live claimant
+can own a job. The service restarts failed workers. An expired lease can be
+reclaimed, but a previous owner cannot acknowledge the replacement's work.
+Three repeated worker failures or lease expirations require attention.
+
+Handoffs and task recovery use the existing authorization, source-epoch,
+checkpoint, approval, and receipt checks. Provider backoff is stored as a due
+time instead of blocking the worker. Existing monitors finish normally; queued
+jobs wait on the same task locks and take over if those monitors exit. Queue
+adoption enrolls only existing active current-request tasks and pending handoffs.
+It does not wake paused tasks or revive an older request.
+
+The worker can restore an old callback-directory mismatch only when the original
+checkpoint digest, workspace fingerprint, and request epoch still match. Actual
+source changes or newer input do not qualify. A crash after send intent is
+recorded cannot cause an automatic second send: uncertain outcomes become
+`attention` and need receipt reconciliation. This is not an exactly-once claim
+across the Desktop IPC boundary.
+
+```sh
+python3 scripts/codex_context_handoff.py queue-status
+systemctl --user status codex-context-handoff-queue.service
+journalctl --user -u codex-context-handoff-queue.service -n 30
+systemctl --user restart codex-context-handoff-queue.service
+```
+
+`attention` reasons are retained in the database and emitted to the service
+journal. The private environment snapshot contains only Desktop pipe/WSL routing
+and PATH, never API credentials. Fresh hooks update routing after Desktop
+reconnects. Stopping this service preserves pending jobs and does not stop a
+Desktop-owned model turn. Disable it with `systemctl --user disable --now
+codex-context-handoff-queue.service`; the database and all original history stay.
+This service is intentionally retained for recovery; inspect its status after
+upgrades. Keep a 16 MiB review budget for its initial database; do not automatically
+prune job history or unrelated caches. No additional containers or listeners are used.
+
+
+
 ## Resilience and safety
 
 ### Optional recovery for capacity errors and premature finishes

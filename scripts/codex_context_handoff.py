@@ -14,11 +14,13 @@ import random
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import uuid
 
 VERSION = 1
 DEFAULT_ROOT = Path.home() / '.local/share/codex-context-handoff'
@@ -46,6 +48,231 @@ def load_json(path, default=None):
         return json.loads(Path(path).read_text())
     except FileNotFoundError:
         return default
+
+
+def queue_enabled(config):
+    return bool(config.get('enabled') and config.get('queue', {}).get('enabled'))
+
+
+def capture_queue_environment(root):
+    # Desktop routing only. Never persist account tokens or arbitrary environment.
+    if os.environ.get('CODEX_APP_TOOLS_PIPE_PATH'):
+        names = ('CODEX_APP_TOOLS_PIPE_PATH', 'WSL_INTEROP', 'WSLENV', 'PATH')
+        atomic_json(Path(root)/'queue-environment.json', {key: os.environ[key] for key in names if key in os.environ})
+
+
+class RecoveryQueue:
+    """Private, transactionally claimed local jobs. External sends keep their receipt guards."""
+    def __init__(self, root):
+        root = Path(root);root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.path = root/'queue.sqlite3'
+        if self.path.is_symlink():
+            raise ValueError('Queue database cannot be a symlink')
+        descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.close(descriptor);os.chmod(self.path, 0o600)
+        with self.connect() as db:
+            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('''CREATE TABLE IF NOT EXISTS jobs (
+                job_key TEXT PRIMARY KEY, kind TEXT NOT NULL, session_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL,
+                due REAL NOT NULL, owner TEXT, lease_until REAL, attempts INTEGER NOT NULL DEFAULT 0,
+                outcome TEXT, updated REAL NOT NULL)''')
+
+    @contextlib.contextmanager
+    def connect(self):
+        db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+        db.row_factory = sqlite3.Row
+        db.execute('PRAGMA synchronous=FULL')
+        try:
+            yield db
+        finally:
+            db.close()
+
+    def enqueue(self, kind, sid, epoch, payload=None, now=None):
+        if kind not in ('handoff', 'task') or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', sid):
+            raise ValueError('Invalid queue job identity')
+        now = time.time() if now is None else now
+        key = f'{kind}:{sid}:{int(epoch)}'
+        with self.connect() as db:
+            db.execute('''INSERT INTO jobs(job_key,kind,session_id,epoch,payload,status,due,updated)
+                VALUES(?,?,?,?,?,'pending',?,?) ON CONFLICT(job_key) DO UPDATE SET payload=excluded.payload
+                WHERE jobs.status='pending' ''', (key,kind,sid,epoch,json.dumps(payload or {}),now,now))
+        return key
+
+    def claim(self, now=None, lease_seconds=120):
+        now = time.time() if now is None else now
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('''SELECT * FROM jobs WHERE (status='pending' AND due<=?)
+                OR (status='leased' AND lease_until<=?) ORDER BY due,job_key LIMIT 1''',(now,now)).fetchone()
+            if row is None:
+                db.commit();return None
+            attempts = row['attempts'] + int(row['status']=='leased')
+            if attempts >= 3:
+                db.execute("UPDATE jobs SET status='attention',outcome='lease_retries_exhausted',updated=? WHERE job_key=?",
+                           (now,row['job_key']))
+                db.commit();return None
+            owner = uuid.uuid4().hex
+            db.execute("UPDATE jobs SET status='leased',owner=?,lease_until=?,attempts=?,updated=? WHERE job_key=?",
+                       (owner,now+lease_seconds,attempts,now,row['job_key']))
+            db.commit()
+            job = dict(row);job.update(owner=owner,lease_until=now+lease_seconds,status='leased',attempts=attempts)
+            job['payload'] = json.loads(job['payload'])
+            return job
+
+    def heartbeat(self, job, now=None, lease_seconds=120):
+        now = time.time() if now is None else now
+        with self.connect() as db:
+            return db.execute('''UPDATE jobs SET lease_until=?,updated=? WHERE job_key=?
+                AND owner=? AND status='leased' AND lease_until>?''',
+                (now+lease_seconds,now,job['job_key'],job['owner'],now)).rowcount == 1
+
+    def finish(self, job, status, outcome, now=None, delay=0, payload=None, attempts=None):
+        if status not in ('pending', 'done', 'cancelled', 'attention'):
+            raise ValueError('Invalid queue outcome')
+        now = time.time() if now is None else now
+        with self.connect() as db:
+            return db.execute('''UPDATE jobs SET status=?,outcome=?,due=?,payload=?,attempts=?,
+                owner=NULL,lease_until=NULL,updated=? WHERE job_key=? AND owner=? AND status='leased' AND lease_until>?''',
+                (status,outcome,now+delay,json.dumps(job['payload'] if payload is None else payload),
+                 job['attempts'] if attempts is None else attempts,now,job['job_key'],job['owner'],now)).rowcount == 1
+
+    def rows(self):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute('''SELECT job_key,kind,session_id,epoch,status,due,
+                lease_until,attempts,outcome,updated FROM jobs ORDER BY updated DESC''')]
+
+
+def process_queue_job(root, job):
+    if not os.environ.get('CODEX_APP_TOOLS_PIPE_PATH'):
+        return {'status': 'observer_unavailable'}
+    if job['kind'] == 'handoff':
+        restore_handoff_workspace(session_dir(root,job['session_id']))
+        return continue_work(root, job['session_id'])
+    return watch_task(root, job['session_id'], max_polls=1, sleeper=lambda _: None,
+                      queue_routing=job['payload'], defer_capacity=True,
+                      capacity_ready_turn=job['payload'].get('capacity_ready_turn'))
+
+
+def run_queue_once(root, handler=None, now=None):
+    queue = RecoveryQueue(root)
+    config = load_json(Path(root)/'settings.json', {})
+    if not queue_enabled(config):
+        return False
+    lease_seconds = config.get('queue', {}).get('lease_seconds', 120)
+    job = queue.claim(now=now, lease_seconds=lease_seconds)
+    if not job:
+        return False
+    stopped = threading.Event()
+    def renew():
+        while not stopped.wait(max(1, lease_seconds/3)):
+            if not queue.heartbeat(job, lease_seconds=lease_seconds):
+                return
+    thread = threading.Thread(target=renew, daemon=True);thread.start()
+    try:
+        directory = session_dir(root, job['session_id'])
+        state = load_json(directory/'state.json', {})
+        if (not config.get('enabled') or state.get('prompt_epoch') != job['epoch'] or
+                (config.get('allowed_sessions') and job['session_id'] not in config['allowed_sessions'])):
+            queue.finish(job,'cancelled','disabled_or_new_user_input',now=now);return True
+        try:
+            result = (handler or (lambda value: process_queue_job(root,value)))(job)
+        except BlockingIOError:
+            queue.finish(job,'pending','existing_worker_owns_job',now=now,delay=15);return True
+        except Exception as exc:
+            state = load_json(directory/'state.json', {})
+            control = load_json(directory/'task-control.json', {})
+            uncertain = dispatch_started(state.get('auto_continuation', {})) if job['kind']=='handoff' else control.get('dispatching_at')
+            attempts = job['attempts'] + 1
+            queue.finish(job,'attention' if uncertain or attempts>=3 else 'pending',
+                         'uncertain_send' if uncertain else type(exc).__name__,now=now,
+                         delay=min(30,2**attempts),attempts=attempts)
+            return True
+        status = result.get('status','unknown_outcome')
+        if status == 'capacity_backoff':
+            payload = dict(job['payload'],capacity_ready_turn=result['turn_id'])
+            queue.finish(job,'pending',status,now=now,delay=result['delay'],payload=payload)
+        elif status in ('poll_limit','observer_unavailable','capacity_dispatched','source_stop_not_confirmed','running_operations'):
+            payload = dict(job['payload']);payload.pop('capacity_ready_turn',None)
+            queue.finish(job,'pending',status,now=now,delay=config.get('task_recovery',{}).get('poll_seconds',15),payload=payload)
+        elif status in ('desktop_dispatched','turn_completed','no_remaining_work','inactive_or_new_user_input','handed_off',
+                        'cancelled_new_source_input','new_user_input','automatic_mode_disabled','automatic_recovery_disabled',
+                        'manual_or_unknown_interruption'):
+            queue.finish(job,'done',status,now=now)
+        elif status == 'already_dispatched_or_ambiguous':
+            prior = load_json(directory/'state.json',{}).get('auto_continuation',{}).get('status')
+            queue.finish(job,'done' if prior in ('desktop_dispatched','turn_completed','no_remaining_work') else 'attention',status,now=now)
+        else:
+            queue.finish(job,'attention',status,now=now)
+        return True
+    finally:
+        stopped.set();thread.join(timeout=1)
+
+
+def queue_worker(root):
+    root = Path(root);root.mkdir(parents=True,exist_ok=True,mode=0o700)
+    with locked(root,'queue-worker.lock',blocking=False):
+        reported = set()
+        while queue_enabled(load_json(root/'settings.json',{})):
+            environment = load_json(root/'queue-environment.json',{})
+            for key in ('CODEX_APP_TOOLS_PIPE_PATH','WSL_INTEROP','WSLENV','PATH'):
+                if key in environment:
+                    os.environ[key] = environment[key]
+            worked = run_queue_once(root)
+            for row in RecoveryQueue(root).rows():
+                marker = (row['job_key'],row['updated'])
+                if row['status']=='attention' and marker not in reported:
+                    print(json.dumps({'job':row['job_key'],'status':'attention','reason':row['outcome']}),flush=True)
+                    reported.add(marker)
+            if not worked:
+                time.sleep(2)
+
+
+def adopt_queue_jobs(root):
+    """Enroll existing authorized state without waking stale, paused or dispatched tasks."""
+    config = load_json(Path(root)/'settings.json',{})
+    if not queue_enabled(config):
+        return 0
+    count = 0
+    for path in sorted((Path(root)/'sessions').glob('*/state.json')):
+        state = load_json(path,{})
+        sid = state.get('session_id')
+        if not sid or (config.get('allowed_sessions') and sid not in config['allowed_sessions']):
+            continue
+        task = load_json(path.with_name('task.json'),{})
+        if (recovery_enabled(config) and task.get('status')=='active' and
+                task.get('prompt_epoch')==state.get('prompt_epoch') and
+                not (state.get('successor_ready') and state.get('successor_prompt_epoch')==state.get('prompt_epoch'))):
+            schedule_task_watch(root,sid);count += 1
+        if (config.get('auto_continue') and state.get('successor_ready') and
+                state.get('source_stopped_epoch')==state.get('successor_prompt_epoch')==state.get('prompt_epoch') and
+                not dispatch_started(state.get('auto_continuation',{}))):
+            RecoveryQueue(root).enqueue('handoff',sid,state['prompt_epoch']);count += 1
+    return count
+
+
+def restore_handoff_workspace(directory):
+    """Repair callback CWD drift only against the unchanged accepted digest, epoch and fingerprint."""
+    directory = Path(directory)
+    with locked(directory):
+        state = load_json(directory/'state.json',{})
+        accepted = state.get('checkpoint',{})
+        if (not state.get('successor_ready') or accepted.get('prompt_epoch') != state.get('prompt_epoch') or
+                state.get('successor_prompt_epoch') != state.get('prompt_epoch') or
+                dispatch_started(state.get('auto_continuation',{}))):
+            return False
+        try:
+            candidate = dict(state,cwd=load_json(directory/'handoff.json')['cwd'])
+            if not checkpoint_is_current(directory,candidate):
+                return False
+        except (OSError,ValueError,KeyError,TypeError):
+            return False
+        candidate['checkpoint'] = dict(accepted,cwd=candidate['cwd'])
+        if candidate.get('auto_continuation',{}).get('status') in ('checkpoint_changed','checkpoint_changed_before_dispatch'):
+            candidate['auto_continuation'] = {'status':'scheduled','workspace_restored_at':time.time()}
+        atomic_json(directory/'state.json',candidate)
+        return True
+
 
 
 def local_path(value):
@@ -256,7 +483,14 @@ def hook(payload, root):
     watch_due = False
     with locked(directory, blocking=False):
         state = load_json(directory / 'state.json', {'version': VERSION, 'session_id': sid, 'prompt_epoch': 0})
-        state.update(cwd=str(local_path(payload['cwd']).resolve()), transcript_path=str(local_path(transcript)),
+        new_request = event == 'UserPromptSubmit' and (
+            not payload.get('turn_id') or payload['turn_id'] != state.get('last_prompt_turn_id'))
+        transferring = (state.get('successor_ready') and
+                        state.get('successor_prompt_epoch') == state.get('prompt_epoch') and not new_request)
+        # Tool callbacks can alternate between the chat root and its worktree.
+        # Keep the accepted workspace through dispatch until a new request.
+        cwd = state.get('checkpoint', {}).get('cwd', state.get('cwd')) if transferring else payload['cwd']
+        state.update(cwd=str(local_path(cwd).resolve()), transcript_path=str(local_path(transcript)),
                      model=payload.get('model') or state.get('model'),
                      permission_mode=payload.get('permission_mode', state.get('permission_mode')),
                      config_home=str(local_path(config.get('config_home') or
@@ -610,6 +844,12 @@ def schedule_task_watch(root, sid, caller_thread_id=None, caller_turn_id=None):
     if not recovery_enabled(config) or (config.get('allowed_sessions') and sid not in config['allowed_sessions']):
         return False
     directory = session_dir(root, sid)
+    if queue_enabled(config):
+        state = load_json(directory/'state.json', {})
+        capture_queue_environment(root)
+        RecoveryQueue(root).enqueue('task',sid,state['prompt_epoch'],
+            {'caller_thread_id':caller_thread_id or sid,'caller_turn_id':caller_turn_id or state.get('last_prompt_turn_id')})
+        return True
     with locked(directory, 'task-watch-start.lock'):
         worker = load_json(directory/'task-watch.json', {})
         identity = process_identity(worker.get('pid'))
@@ -626,7 +866,8 @@ def schedule_task_watch(root, sid, caller_thread_id=None, caller_turn_id=None):
     return True
 
 
-def watch_task(root, sid, desktop_factory=None, sleeper=None, max_polls=None):
+def watch_task(root, sid, desktop_factory=None, sleeper=None, max_polls=None,
+               queue_routing=None, defer_capacity=False, capacity_ready_turn=None):
     directory = session_dir(root, sid)
     sleeper = sleeper or time.sleep
     factory = desktop_factory or DesktopTools
@@ -648,7 +889,7 @@ def watch_task(root, sid, desktop_factory=None, sleeper=None, max_polls=None):
             if control.get('dispatching_at'):
                 return {'status': 'dispatch_already_attempted'}
             try:
-                routing = load_json(directory/'task-watch.json', {})
+                routing = queue_routing if queue_routing is not None else load_json(directory/'task-watch.json', {})
                 with factory(config_home=state['config_home'], caller_thread_id=routing.get('caller_thread_id', sid),
                              caller_turn_id=routing.get('caller_turn_id') or state.get('last_prompt_turn_id')) as desktop:
                     snapshot = desktop.call('read_thread', {'threadId': sid, 'hostId': 'local', 'turnLimit': 1,
@@ -658,6 +899,8 @@ def watch_task(root, sid, desktop_factory=None, sleeper=None, max_polls=None):
                         turn_id = snapshot['turns'][0]['id']
                         attempt = control.get('capacity_attempts', 0)
                         delay = capacity_delay(snapshot['turns'][0]['error'], attempt, config['task_recovery'])
+                        if defer_capacity and turn_id != capacity_ready_turn:
+                            return {'status':'capacity_backoff','delay':delay,'turn_id':turn_id}
                         # Waiting alone grants no authority. Re-read live state after the backoff.
                         sleeper(delay)
                         current = load_json(directory/'state.json', {})
@@ -732,7 +975,8 @@ def watch_task(root, sid, desktop_factory=None, sleeper=None, max_polls=None):
                     latest.update(status='observer_unavailable', error_type=type(exc).__name__)
                     atomic_json(directory/'task-control.json', latest)
                 return {'status': 'observer_unavailable'}
-            sleeper(config['task_recovery'].get('poll_seconds', 15))
+            if max_polls is None or polls < max_polls:
+                sleeper(config['task_recovery'].get('poll_seconds', 15))
         return {'status': 'poll_limit'}
 
 
@@ -784,6 +1028,7 @@ def ready(root, sid, server_factory=None):
             checkpoint, raw, digest = validate_checkpoint(directory / 'handoff.json', state)
             state['checkpoint'] = {'sha256': digest, 'prompt_epoch': state['prompt_epoch'],
                 'context_tokens': state['context_tokens'], 'status': checkpoint['status'],
+                'cwd': str(Path(state['cwd']).resolve()),
                 'workspace_fingerprint': workspace_fingerprint(state['cwd'], checkpoint['files'], Path(root))}
             atomic_json(directory / 'state.json', state)
         if state.get('successor_ready'):
@@ -942,6 +1187,12 @@ def schedule_continuation(root, sid):
         if state.get('source_stopped_epoch') != state['successor_prompt_epoch']:
             state['auto_continuation'] = {'status': 'waiting_for_source_stop'}
             atomic_json(directory/'state.json', state)
+            return True
+        if queue_enabled(config):
+            state['auto_continuation'] = {'status':'scheduled','scheduled_at':time.time()}
+            atomic_json(directory/'state.json',state)
+            capture_queue_environment(root)
+            RecoveryQueue(root).enqueue('handoff',sid,state['prompt_epoch'])
             return True
         coordinator = state.get('continuation_coordinator', {})
         identity = process_identity(coordinator.get('pid'))
@@ -1416,7 +1667,7 @@ def main():
     probe = sub.add_parser('probe', help='Create, initialize, verify and archive a synthetic canary')
     probe.add_argument('--cwd', type=Path, required=True)
     probe.add_argument('--output', type=Path, required=True)
-    for name in ('hook', 'ready', 'continue', 'supervise', 'status', 'disable', 'task', 'watch-task'):
+    for name in ('hook', 'ready', 'continue', 'supervise', 'status', 'disable', 'task', 'watch-task', 'queue-worker', 'queue-status'):
         command = sub.add_parser(name)
         command.add_argument('--root', type=Path, default=DEFAULT_ROOT)
         if name in ('ready', 'continue', 'supervise', 'status', 'task', 'watch-task'):
@@ -1425,6 +1676,12 @@ def main():
             command.add_argument('--file', type=Path, help='Register/update a task ledger JSON file')
             command.add_argument('--pause', action='store_true', help='Pause recovery for this task')
     args = parser.parse_args()
+    if args.command == 'queue-worker':
+        queue_worker(args.root)
+        return
+    if args.command == 'queue-status':
+        print(json.dumps({'jobs':RecoveryQueue(args.root).rows()},indent=2))
+        return
     if args.command == 'hook':
         try:
             result = hook(json.load(sys.stdin), args.root)

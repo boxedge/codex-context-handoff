@@ -224,6 +224,23 @@ class TaskRecoveryTests(unittest.TestCase):
         self.assertIn('reference data',sends[0]['prompt'])
         self.assertEqual(h.load_json(self.directory/'task-control.json')['capacity_attempts'],1)
 
+    def test_sqlite_queue_defers_capacity_then_dispatches_once_after_persisted_deadline(self):
+        config = dict(self.config,queue={'enabled':True},
+                      task_recovery=dict(self.config['task_recovery'],capacity_delay=30))
+        h.atomic_json(self.root/'settings.json',config)
+        queue=h.RecoveryQueue(self.root);queue.enqueue('task',self.sid,1,{},now=100)
+        desktop,calls=self.desktop([self.snapshot()])
+        with patch.object(h,'DesktopTools',desktop),patch.dict(h.os.environ,{'CODEX_APP_TOOLS_PIPE_PATH':'fixture'}):
+            h.run_queue_once(self.root,now=100)
+            self.assertFalse(any(name=='send_message_to_thread' for name,_ in calls))
+            due=queue.rows()[0]['due'];self.assertGreaterEqual(due,130)
+            self.assertFalse(h.run_queue_once(self.root,now=129))
+            h.run_queue_once(self.root,now=due)
+            self.assertEqual(sum(name=='send_message_to_thread' for name,_ in calls),1)
+            h.run_queue_once(self.root,now=due+20)
+            self.assertEqual(sum(name=='send_message_to_thread' for name,_ in calls),1)
+
+
     def test_native_system_error_capacity_failure_retries_once(self):
         # Native read_thread reports provider-failed threads as systemError.
         snapshot = self.snapshot(thread_status='systemError', error={

@@ -103,6 +103,102 @@ class HandoffTests(unittest.TestCase):
         FakeServer.answer = {key:value[key] for key in ('source_thread_id','goal','constraints','next_action')}
         return value
 
+    def test_queue_service_is_owned_supervised_and_uses_the_existing_loader(self):
+        calls=[];units=self.base/'units'
+        report=installer.install_queue_service(self.root,self.base/'loader.py',unit_directory=units,
+            runner=lambda args,**kwargs:calls.append(args))
+        unit=Path(report['unit']).read_text()
+        self.assertIn('queue-worker',unit)
+        self.assertIn('Restart=on-failure',unit)
+        self.assertIn('UMask=0077',unit)
+        self.assertTrue(m.load_json(self.root/'settings.json')['queue']['enabled'])
+        self.assertEqual(calls[-1],['systemctl','--user','restart','codex-context-handoff-queue.service'])
+
+
+    def test_queue_installer_preserves_an_unowned_existing_unit(self):
+        units=self.base/'units';units.mkdir()
+        path=units/'codex-context-handoff-queue.service';path.write_text('Unrelated existing service\n')
+        with self.assertRaisesRegex(ValueError,'unrecognized'):
+            installer.install_queue_service(self.root,self.base/'loader.py',unit_directory=units,
+                                             runner=lambda *args,**kwargs:self.fail('Unexpected service action'))
+        self.assertEqual(path.read_text(),'Unrelated existing service\n')
+
+
+    def test_tool_directory_change_preserves_accepted_handoff_workspace(self):
+        self.settings['continuation_backend'] = 'desktop'
+        self.automatic_fixture()
+        other = self.base/'other-tool-directory';other.mkdir()
+        self.payload.update(cwd=str(other),hook_event_name='PostToolUse')
+        m.hook(self.payload,self.root)
+        state = m.load_json(self.directory/'state.json')
+        self.assertEqual(state['cwd'],str(self.cwd))
+        self.assertEqual(state['checkpoint']['cwd'],str(self.cwd))
+        self.assertTrue(m.checkpoint_is_current(self.directory,state))
+        result = m.continue_work(self.root,self.sid,desktop_factory=FakeDesktop)
+        self.assertEqual(result['status'],'desktop_dispatched')
+        self.assertEqual(sum(name=='send_message_to_thread' for name,_ in FakeDesktop.calls),1)
+
+
+    def test_stop_from_another_directory_keeps_the_verified_workspace(self):
+        self.settings['continuation_backend'] = 'desktop'
+        self.automatic_fixture(stopped=False)
+        other = self.base/'stop-directory';other.mkdir()
+        self.payload.update(cwd=str(other),hook_event_name='Stop')
+        with patch.object(m,'schedule_continuation',return_value=True):
+            m.hook(self.payload,self.root)
+        state = m.load_json(self.directory/'state.json')
+        self.assertEqual(state['cwd'],str(self.cwd))
+        self.assertTrue(m.checkpoint_is_current(self.directory,state))
+        result = m.continue_work(self.root,self.sid,desktop_factory=FakeDesktop)
+        self.assertEqual(result['status'],'desktop_dispatched')
+
+
+    def test_new_user_directory_is_observed_and_still_cancels_old_handoff(self):
+        self.automatic_fixture()
+        other = self.base/'new-request-directory';other.mkdir()
+        self.payload.update(cwd=str(other),hook_event_name='UserPromptSubmit',turn_id='new-source-request')
+        m.hook(self.payload,self.root)
+        self.assertEqual(m.load_json(self.directory/'state.json')['cwd'],str(other))
+        self.assertEqual(m.continue_work(self.root,self.sid,desktop_factory=FakeDesktop)['status'],
+                         'cancelled_new_source_input')
+        self.assertFalse(any(name=='send_message_to_thread' for name,_ in FakeDesktop.calls))
+
+
+    def test_real_workspace_change_is_not_hidden_by_pinned_directory(self):
+        subprocess.run(['git','init','-q',str(self.cwd)],check=True)
+        file = self.cwd/'pending.txt';file.write_text('before')
+        self.automatic_fixture()
+        file.write_text('actual source change')
+        other = self.base/'other-directory';other.mkdir()
+        self.payload.update(cwd=str(other),hook_event_name='PostToolUse')
+        m.hook(self.payload,self.root)
+        self.assertEqual(m.continue_work(self.root,self.sid,desktop_factory=FakeDesktop)['status'],
+                         'checkpoint_changed')
+        self.assertFalse(any(name=='send_message_to_thread' for name,_ in FakeDesktop.calls))
+
+
+    def test_queued_recovery_restores_legacy_callback_directory_only_for_exact_accepted_state(self):
+        self.settings['continuation_backend']='desktop'
+        self.automatic_fixture()
+        state=m.load_json(self.directory/'state.json');state['checkpoint'].pop('cwd')
+        state['cwd']=str(self.base/'wrong-callback-directory')
+        state['auto_continuation']={'status':'checkpoint_changed'}
+        m.atomic_json(self.directory/'state.json',state)
+        self.assertTrue(m.restore_handoff_workspace(self.directory))
+        self.assertEqual(m.load_json(self.directory/'state.json')['cwd'],str(self.cwd))
+        self.assertEqual(m.continue_work(self.root,self.sid,desktop_factory=FakeDesktop)['status'],'desktop_dispatched')
+
+
+    def test_workspace_restoration_never_accepts_changed_files_or_newer_input(self):
+        self.automatic_fixture()
+        state=m.load_json(self.directory/'state.json');state['cwd']=str(self.base/'wrong-directory')
+        state['prompt_epoch']+=1;m.atomic_json(self.directory/'state.json',state)
+        self.assertFalse(m.restore_handoff_workspace(self.directory))
+        state['prompt_epoch']-=1;m.atomic_json(self.directory/'state.json',state)
+        (self.directory/'handoff.json').write_text((self.directory/'handoff.json').read_text()+' ')
+        self.assertFalse(m.restore_handoff_workspace(self.directory))
+
+
     def test_disabled_is_a_noop_even_without_a_transcript(self):
         self.settings['enabled']=False;m.atomic_json(self.root/'settings.json',self.settings)
         self.assertEqual(m.hook(self.payload,self.root),{})

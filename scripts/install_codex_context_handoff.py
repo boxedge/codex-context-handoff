@@ -9,11 +9,12 @@ from pathlib import Path
 import re
 import shutil
 import shlex
+import subprocess
 import sys
 import time
 import tomllib
 
-from codex_context_handoff import AppServer, DEFAULT_ROOT, atomic_bytes, atomic_json, load_json, local_path
+from codex_context_handoff import AppServer, DEFAULT_ROOT, atomic_bytes, atomic_json, load_json, local_path, capture_queue_environment, adopt_queue_jobs, RecoveryQueue
 
 EVENTS = ('PreToolUse', 'PostToolUse', 'UserPromptSubmit', 'Stop', 'PreCompact')
 CONTEXT_EVENTS = {'PreToolUse', 'PostToolUse', 'UserPromptSubmit'}
@@ -96,7 +97,34 @@ def compatibility_entrypoint(alias, installed, library, backups):
     return alias
 
 
-def install(root=DEFAULT_ROOT, homes=None, library=None, entrypoint=None):
+def install_queue_service(root, executable, unit_directory=None, runner=None):
+    runner = runner or subprocess.run
+    directory = Path(unit_directory or Path.home()/'.config/systemd/user')
+    directory.mkdir(parents=True,exist_ok=True)
+    path = directory/'codex-context-handoff-queue.service'
+    marker = '# Managed by codex-context-handoff queue\n'
+    if path.exists() and not path.read_text().startswith(marker):
+        raise ValueError('Refusing to replace an unrecognized queue service')
+    command = '/usr/bin/python3 ' + shlex.join([str(executable),'queue-worker','--root',str(root)])
+    unit = (marker + '[Unit]\nDescription=Durable Codex continuation queue\nStartLimitIntervalSec=0\n\n'
+            '[Service]\nType=simple\nUMask=0077\nExecStart=' + command.replace('%','%%') +
+            '\nRestart=on-failure\nRestartSec=2\nTimeoutStopSec=15\n\n[Install]\nWantedBy=default.target\n')
+    atomic_bytes(path,unit.encode())
+    settings = load_json(Path(root)/'settings.json')
+    settings['queue'] = dict(settings.get('queue',{}),enabled=True)
+    atomic_json(Path(root)/'settings.json',settings)
+    capture_queue_environment(root)
+    RecoveryQueue(root)
+    adopted = adopt_queue_jobs(root)
+    for command in (['systemctl','--user','daemon-reload'],
+                    ['systemctl','--user','enable','codex-context-handoff-queue.service'],
+                    ['systemctl','--user','restart','codex-context-handoff-queue.service']):
+        runner(command,check=True,capture_output=True,text=True)
+    return {'unit':str(path),'database':str(Path(root)/'queue.sqlite3'),'adopted_jobs':adopted}
+
+
+
+def install(root=DEFAULT_ROOT, homes=None, library=None, entrypoint=None, enable_queue=False):
     root = Path(root)
     homes = tuple(dict.fromkeys(local_path(p).expanduser().resolve() for p in
                                 (homes if homes is not None else default_homes())))
@@ -153,6 +181,8 @@ def install(root=DEFAULT_ROOT, homes=None, library=None, entrypoint=None):
             raise ValueError('Handoff hooks are not enabled')
         report['homes'].append({'home':str(home),'hooks':[{key:row.get(key) for key in ('key','eventName','enabled','currentHash','status')} for row in verified],
                                 'model_settings_preserved':True})
+    if enable_queue or load_json(settings).get('queue',{}).get('enabled'):
+        report['queue'] = install_queue_service(root,executable)
     atomic_json(root/'installation.json',report)
     return report
 
@@ -164,5 +194,6 @@ if __name__ == '__main__':
     parser.add_argument('--home',type=Path,action='append',dest='homes',
                         help='Codex home to configure; repeat for multiple homes. Defaults to CODEX_HOME or ~/.codex.')
     parser.add_argument('--library',type=Path,help='Versioned helper directory (default: ~/.local/lib/codex-context-handoff)')
+    parser.add_argument('--enable-queue',action='store_true')
     args=parser.parse_args()
-    print(json.dumps(install(args.root,homes=args.homes,library=args.library,entrypoint=args.entrypoint),indent=2))
+    print(json.dumps(install(args.root,homes=args.homes,library=args.library,entrypoint=args.entrypoint,enable_queue=args.enable_queue),indent=2))

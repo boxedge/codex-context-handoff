@@ -240,3 +240,12 @@ monitor only after native dispatch acceptance. Initial bootstrap stays read-only
 State and logs are private operational data. Redact paths, task text, IDs and
 IPC details before reporting bugs. Configuration backups can contain sensitive
 settings, so keep them outside the public checkout.
+
+## Durable queue and callback directories
+
+The README documents `--enable-queue`, SQLite leases and persisted deadlines,
+worker supervision, `queue-status`, and inspection of `attention` outcomes.
+Accepted workspace directories stay pinned across tool callbacks and Stop. The
+queue can restore historical callback-directory drift only with the same request
+epoch, immutable digest and workspace fingerprint; changed source or new input
+still stops transfer. Ambiguous sends are retained for reconciliation, never replayed.
