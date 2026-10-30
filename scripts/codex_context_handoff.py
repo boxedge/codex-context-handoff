@@ -1418,7 +1418,8 @@ def ready(root, sid, server_factory=None, desktop_factory=None):
                 messages = server.seed(state['successor_id'], prompt, config.get('bootstrap_timeout', 90), schema=schema)
                 if not messages or json.loads(messages[-1]) != expected:
                     raise ValueError('Successor did not confirm the complete goal, restrictions and next action')
-            visible = server.rpc('thread/list', {'limit': 100, 'sortKey': 'updated_at'})['data']
+            visible = server.rpc('thread/list', {'limit': 100, 'sortKey': 'updated_at',
+                                  'modelProviders': None, 'sourceKinds': [], 'useStateDbOnly': True})['data']
             if not any(row['id'] == state['successor_id'] for row in visible):
                 raise RuntimeError('Successor was initialized but is not listed; source chat retained')
         if (use_desktop and state.get('source_project') and

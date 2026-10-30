@@ -823,6 +823,9 @@ class HandoffTests(unittest.TestCase):
                        permission_mode='bypassPermissions', successor_creation={'backend': 'native', 'status': 'prepared'})
         class ConfirmedServer(FakeServer):
             def rpc(self, method, args, **kwargs):
+                if method == 'thread/list':
+                    visible = args.get('sourceKinds') == [] and args.get('modelProviders', 'default') is None
+                    return {'data': [{'id': 'successor-1'}] if visible else []}
                 if method == 'thread/read' and args['threadId'] == 'successor-1':
                     return {'thread': {'turns': [{'id': 'bootstrap', 'status': 'completed',
                         'items': [{'type': 'agentMessage', 'text': json.dumps(FakeServer.answer)}]}]}}
