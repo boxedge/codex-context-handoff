@@ -62,6 +62,88 @@ class TaskRecoveryTests(unittest.TestCase):
                 return {'status': 'accepted'}
         return Desktop, calls
 
+    def blocker(self, steps=None, **changes):
+        value = {'steps': steps or list(self.value['remaining']), 'kind': 'dependency',
+                 'required_action': 'Independent owner restores the maintained runner connection',
+                 'evidence': ['Runner connection readback: unavailable'],
+                 'attempted_alternatives': ['Existing scoped runner route also returned unavailable']}
+        value.update(changes)
+        return value
+
+    def test_vague_approval_blocker_cannot_stop_an_active_task(self):
+        with self.assertRaisesRegex(ValueError, 'blockers'):
+            h.register_task(self.root,self.sid,dict(self.value,status='blocked',reason='Need your approval'))
+        self.assertEqual(h.load_json(self.directory/'task.json')['status'],'active')
+
+    def test_partial_blocker_keeps_other_work_active(self):
+        blocker = self.blocker(['Verify installed outcome'])
+        value = dict(self.value,blockers=[blocker])
+        h.register_task(self.root,self.sid,value)
+        with self.assertRaisesRegex(ValueError, 'every remaining step'):
+            h.register_task(self.root,self.sid,dict(value,status='blocked',reason='Runner unavailable'))
+        self.assertEqual(h.task_recovery_hook({'hook_event_name':'Stop'},
+            self.root,self.directory,self.state,self.config)['decision'],'block')
+
+    def test_blocked_update_cannot_drop_unfinished_work_to_claim_full_coverage(self):
+        value = dict(self.value,status='blocked',reason='Runner unavailable',
+                     remaining=['Verify installed outcome'],blockers=[self.blocker(['Verify installed outcome'])])
+        with self.assertRaisesRegex(ValueError, 'remaining work'):
+            h.register_task(self.root,self.sid,value)
+        self.assertEqual(h.load_json(self.directory/'task.json')['remaining'],self.value['remaining'])
+
+    def test_blocker_needs_concrete_action_evidence_and_attempted_alternatives(self):
+        for field in ('required_action','evidence','attempted_alternatives','steps'):
+            for invalid in ('',[],None):
+                blocker = self.blocker()
+                blocker[field] = invalid
+                with self.subTest(field=field,invalid=invalid),self.assertRaises(ValueError):
+                    h.validate_task(dict(self.value,status='blocked',reason='Runner unavailable',blockers=[blocker]))
+        for blockers in (None,{},['Need approval']):
+            with self.subTest(blockers=blockers),self.assertRaises(ValueError):
+                h.validate_task(dict(self.value,status='blocked',reason='Runner unavailable',blockers=blockers))
+
+    def test_blockers_must_reference_remaining_steps(self):
+        with self.assertRaisesRegex(ValueError, 'remaining'):
+            h.validate_task(dict(self.value,blockers=[self.blocker(['An unrelated task'])]))
+
+    def test_already_granted_authorization_cannot_be_a_permission_blocker(self):
+        for authorization in (None,'already_granted'):
+            with self.subTest(authorization=authorization),self.assertRaisesRegex(ValueError, 'authorization'):
+                h.validate_task(dict(self.value,status='blocked',reason='Need approval',blockers=[
+                    self.blocker(kind='permission',authorization_status=authorization)]))
+        value = dict(self.value,status='blocked',reason='New scope requires authorization',blockers=[
+            self.blocker(kind='permission',authorization_status='not_granted')])
+        self.assertEqual(h.validate_task(value)['status'],'blocked')
+
+    def test_rewording_blockers_does_not_reset_stop_retry_budget(self):
+        value = dict(self.value,blockers=[self.blocker(['Verify installed outcome'])])
+        h.register_task(self.root,self.sid,value)
+        h.task_recovery_hook({'hook_event_name':'Stop'},self.root,self.directory,self.state,self.config)
+        value['blockers'][0]['required_action'] = 'Restore the same unavailable runner connection'
+        h.register_task(self.root,self.sid,value)
+        self.assertEqual(h.load_json(self.directory/'task-control.json')['premature_attempts'],1)
+
+    def test_legacy_unsupported_blocked_stop_requires_bounded_reassessment(self):
+        h.atomic_json(self.directory/'task.json',dict(self.task,status='blocked',reason='Need approval'))
+        for _ in range(3):
+            result = h.task_recovery_hook({'hook_event_name':'Stop'},self.root,self.directory,self.state,self.config)
+            self.assertEqual(result.get('decision'),'block')
+            self.assertIn('blockers',result['reason'])
+            self.assertIn('already granted',result['reason'])
+        self.assertIn('paused',h.task_recovery_hook({'hook_event_name':'Stop'},
+            self.root,self.directory,self.state,self.config)['systemMessage'])
+        self.assertEqual(h.load_json(self.directory/'task.json')['status'],'paused')
+
+    def test_successor_preserves_partial_blockers_for_still_pending_steps(self):
+        value = dict(self.value,blockers=[self.blocker(['Verify installed outcome'])])
+        h.register_task(self.root,self.sid,value)
+        successor = h.session_dir(self.root,'successor')
+        h.atomic_json(successor/'state.json',{'session_id':'successor','prompt_epoch':0})
+        checkpoint = {'status':'active','goal':'A short summary','constraints':['No deployment'],
+                      'remaining':['Verify installed outcome'],'next_action':'Inspect runtime'}
+        h.seed_successor_task(self.root,dict(self.state,successor_id='successor'),checkpoint)
+        self.assertEqual(h.load_json(successor/'task.json')['blockers'],value['blockers'])
+
     def test_completion_requires_evidence_for_every_full_goal_criterion(self):
         value = dict(self.value, status='complete', remaining=[], evidence={'Fixture tested': ['test output']})
         with self.assertRaisesRegex(ValueError, 'every criterion'): h.validate_task(value)
@@ -95,6 +177,7 @@ class TaskRecoveryTests(unittest.TestCase):
         for status in ('complete', 'blocked', 'paused'):
             value = dict(self.value, status=status, reason='Operator decision', remaining=[] if status=='complete' else self.value['remaining'],
                          evidence={v:['recorded proof'] for v in self.value['acceptance']})
+            if status == 'blocked':value['blockers'] = [self.blocker()]
             h.register_task(self.root,self.sid,value)
             self.assertEqual(h.task_recovery_hook({'hook_event_name':'Stop'},self.root,self.directory,self.state,self.config),{})
 
@@ -172,7 +255,7 @@ class TaskRecoveryTests(unittest.TestCase):
         result=h.watch_task(self.root,self.sid,desktop_factory=desktop,sleeper=lambda _:None,max_polls=1)
         self.assertEqual(result['status'],'capacity_retries_exhausted')
         self.assertFalse(any(n=='send_message_to_thread' for n,_ in calls))
-        self.assertEqual(h.load_json(self.directory/'task.json')['status'],'blocked')
+        self.assertEqual(h.load_json(self.directory/'task.json')['status'],'paused')
         h.register_task(self.root,self.sid,self.value)
         self.assertEqual(h.load_json(self.directory/'task-control.json')['capacity_attempts'],0)
 

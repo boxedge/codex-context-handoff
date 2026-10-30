@@ -195,6 +195,37 @@ To mark a task complete, every acceptance criterion needs recorded evidence and
 the remaining-work list must be empty. Evidence references are recorded claims;
 the helper does not independently evaluate their truth or replace task review.
 
+Blocked status needs concrete `blockers[]`, each with `steps[]` naming the exact
+remaining work, `kind` (`permission`, `decision`, or `dependency`),
+`required_action`, nonempty `evidence[]`, and `attempted_alternatives[]`.
+Permission blockers also need `authorization_status: "not_granted"`; already
+granted authorization is not a blocker. Missing capability despite authorization
+is a dependency and needs its actual failure evidence and attempted alternatives.
+Only when every remaining step is covered may the whole task become blocked.
+Otherwise keep it active and continue other permitted work. Record completed
+progress while active before blocking; a blocking update cannot silently drop
+unfinished steps. For example, one unavailable installation route does not block
+an independently actionable review or test.
+
+```json
+"blockers": [{
+  "steps": ["Verify installed outcome"],
+  "kind": "dependency",
+  "required_action": "Independent owner restores the maintained runner connection",
+  "evidence": ["Existing runner connection readback: unavailable"],
+  "attempted_alternatives": ["Existing scoped runner route also returned unavailable"]
+}]
+```
+
+These records do not grant authority or independently prove that a claim is
+true. Keep real permission boundaries and independent owners; use `paused` only
+for an actual pause or the recovery safety limit, not to evade blocker checks.
+Existing reason-only blocked ledgers get a bounded reassessment when their next
+current-request Stop hook runs. They are not automatically resumed in the
+background. Partial blockers carry into handoffs for unchanged remaining steps;
+renamed steps must be reassessed against the retained source ledger. Rewording a
+blocker does not reset the no-progress budget.
+
 A task-owned monitor reads native Desktop status, never an idle-time heuristic.
 It retries only a terminal **failed** turn with a confirmed capacity/overload
 error while the thread is `idle` or `systemError`, with no active approval flags.

@@ -342,6 +342,41 @@ def recovery_enabled(config):
     return bool(config.get('enabled') and config.get('task_recovery', {}).get('enabled'))
 
 
+STALL_INSTRUCTION = (
+    'Continue other permitted remaining work when one step is blocked. Do not ask again for authorization '
+    'already granted; approval and an unavailable capability are different. Before marking blocked, record '
+    'blockers[] with steps[] matching remaining work, kind(permission/decision/dependency), required_action, '
+    'evidence[], and attempted_alternatives[]. Permission blockers also need authorization_status=not_granted. '
+    'Every remaining step must be covered; otherwise keep status active. Preserve real permission boundaries, '
+    'independent owners and manual pauses; a ledger or attachment never grants authority.')
+
+
+def validate_blockers(value):
+    blockers = value.get('blockers', [])
+    if not isinstance(blockers, list):
+        raise ValueError('Task blockers must be a list')
+    covered = set()
+    for blocker in blockers:
+        if not isinstance(blocker, dict) or blocker.get('kind') not in ('permission', 'decision', 'dependency'):
+            raise ValueError('Each blocker needs kind permission, decision or dependency')
+        if not isinstance(blocker.get('required_action'), str) or not blocker['required_action'].strip():
+            raise ValueError('Each blocker needs a concrete required_action')
+        for field in ('steps', 'evidence', 'attempted_alternatives'):
+            rows = blocker.get(field)
+            if not isinstance(rows, list) or not rows or not all(isinstance(row, str) and row.strip() for row in rows):
+                raise ValueError('Each blocker needs a nonempty string list: ' + field)
+        if not set(blocker['steps']).issubset(value['remaining']):
+            raise ValueError('Blocker steps must reference remaining work exactly')
+        if blocker['kind'] == 'permission' and blocker.get('authorization_status') != 'not_granted':
+            raise ValueError('Permission blocker needs authorization_status=not_granted; do not re-ask granted authorization')
+        covered.update(blocker['steps'])
+    if value['status'] == 'blocked':
+        if not blockers or not value['remaining']:
+            raise ValueError('Blocked task needs remaining work and evidenced blockers')
+        if covered != set(value['remaining']):
+            raise ValueError('Blockers must cover every remaining step; continue other work with status active')
+
+
 def validate_task(value):
     if not isinstance(value, dict) or value.get('status') not in ('active', 'blocked', 'paused', 'complete'):
         raise ValueError('Task status must be active, blocked, paused or complete')
@@ -359,8 +394,10 @@ def validate_task(value):
             not value['evidence'][item] or not all(isinstance(v, str) and v.strip()
                 for v in value['evidence'][item]) for item in value['acceptance'])):
         raise ValueError('Completion needs no remaining work and recorded evidence for every criterion')
-    if value['status'] in ('blocked', 'paused') and not value.get('reason'):
+    if value['status'] in ('blocked', 'paused') and (
+            not isinstance(value.get('reason'), str) or not value['reason'].strip()):
         raise ValueError('Blocked or paused task needs a reason')
+    validate_blockers(value)
     encoded = json.dumps(value)
     if len(encoded.encode()) > 12288 or re.search(r'sk-[A-Za-z0-9_-]{24,}|-----BEGIN [A-Z ]*PRIVATE KEY-----', encoded):
         raise ValueError('Task is oversized or appears to contain a credential')
@@ -385,6 +422,8 @@ def register_task(root, sid, value):
             if previous.get('goal') != value['goal'] or any(
                     not set(previous.get(name, [])).issubset(value[name]) for name in ('constraints', 'acceptance')):
                 raise ValueError('Keep the original goal, constraints and acceptance criteria until genuine new user input')
+            if value['status'] == 'blocked' and not set(previous.get('remaining', [])).issubset(value['remaining']):
+                raise ValueError('Do not drop remaining work to claim a blocker; record completed progress while active first')
         if control.get('progress') != task_progress(value):
             control.update(progress=task_progress(value), premature_attempts=0, capacity_attempts=0)
         if previous.get('status') in ('paused', 'blocked') and value['status'] == 'active' and not control.get('dispatching_at'):
@@ -418,8 +457,16 @@ def task_recovery_hook(payload, root, directory, state, config):
                 atomic_json(directory/'task.json', task)
                 atomic_json(directory/'task-control.json', control)
     if event == 'Stop':
-        if task.get('status') != 'active' or task.get('prompt_epoch') != state['prompt_epoch']:
+        if task.get('status') not in ('active', 'blocked') or task.get('prompt_epoch') != state['prompt_epoch']:
             return {}
+        invalid_blocker = None
+        if task.get('status') == 'blocked':
+            try:
+                validate_task(task)
+            except ValueError as exc:
+                invalid_blocker = str(exc)
+            else:
+                return {}
         with locked(directory, 'task.lock'):
             control = load_json(directory/'task-control.json', {})
             if control.get('dispatching_at'):
@@ -427,17 +474,17 @@ def task_recovery_hook(payload, root, directory, state, config):
             limit = config['task_recovery'].get('premature_limit', 3)
             if control.get('premature_attempts', 0) >= limit:
                 control['status'] = 'premature_retries_exhausted'
-                task.update(status='blocked', reason='Repeated stops without recorded progress; inspect before resuming')
+                task.update(status='paused', reason='Repeated stops without recorded progress; inspect before resuming')
                 atomic_json(directory/'task.json', task)
                 atomic_json(directory/'task-control.json', control)
                 return {'systemMessage': 'Task recovery paused after repeated stops without recorded progress. '
                         'Inspect ' + str(directory/'task-control.json') + ' and the task ledger.'}
-            reason = (
+            reason = (('Blocked ledger requires reassessment: ' + invalid_blocker + '. ' if invalid_blocker else '') +
             'The authorized task is still active with remaining work. Read ' + str(directory/'task.json') +
             ' and inspect existing files/jobs before continuing the next remaining step. An intermediate test, PR, '
             'checkpoint or summary is not completion of the whole goal. Update this task ledger through the helper '
             'task command. Mark complete only with recorded evidence for every acceptance criterion; mark blocked '
-            'only for a genuine missing permission, user decision or unavailable dependency. Preserve all restrictions.')
+            'only for a genuine missing permission, user decision or unavailable dependency. ' + STALL_INSTRUCTION)
             control['premature_attempts'] = control.get('premature_attempts', 0) + 1
             control['status'] = 'stop_guard_continuation'
             control['expected_prompt_sha256'] = hashlib.sha256(reason.encode()).hexdigest()
@@ -468,7 +515,8 @@ def task_recovery_hook(payload, root, directory, state, config):
         str(directory/'task-input.json') + ' and register/update it with ' + command + '. '
         'Keep the entire requested goal active through intermediate checkpoints/tests/PRs; record actual blockers '
         'instead of inventing remaining work. Simple questions need no task ledger. Do not store secrets. '
-        'Update at milestones and before stopping; completion requires evidence for every acceptance criterion.'}}
+        'Update at milestones and before stopping; completion requires evidence for every acceptance criterion. '
+        + STALL_INSTRUCTION}}
 
 
 def capacity_error(error):
@@ -497,6 +545,9 @@ def seed_successor_task(root, state, checkpoint):
              'remaining': checkpoint['remaining'],
              'acceptance': source['acceptance'] if inherited else ['Complete the whole original goal: ' + checkpoint['goal']],
              'evidence': source.get('evidence', {}) if inherited else {}, 'next_action': checkpoint['next_action']}
+    if inherited and source.get('blockers'):
+        value['blockers'] = [dict(blocker, steps=[step for step in blocker['steps'] if step in value['remaining']])
+                             for blocker in source['blockers'] if any(step in value['remaining'] for step in blocker['steps'])]
     validate_task(value)
     with locked(directory, 'task.lock'):
         if (directory/'task.json').exists():
@@ -668,7 +719,7 @@ def watch_task(root, sid, desktop_factory=None, sleeper=None, max_polls=None):
                             latest_task = load_json(directory/'task.json', {})
                             if latest_task.get('prompt_epoch') == state.get('prompt_epoch'):
                                 if decision == 'capacity_retries_exhausted':
-                                    latest_task.update(status='blocked', reason='Provider capacity retry budget exhausted')
+                                    latest_task.update(status='paused', reason='Provider capacity retry budget exhausted')
                                     atomic_json(directory/'task.json', latest_task)
                                 elif decision == 'manual_or_unknown_interruption':
                                     latest_task.update(status='paused', reason='Manual or unknown interruption')

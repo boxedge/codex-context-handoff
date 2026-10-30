@@ -201,6 +201,13 @@ explicit failed capacity/overload error. A system error alone never permits a re
 An interrupted turn is always left for the user. Work is not retried merely
 because no output arrived for a while. There is no provider/model failover.
 
+Blocked status requires evidence and attempted alternatives for every remaining step.
+Partial blockers keep other work active; previously granted authorization cannot be
+listed as a missing permission. The README documents `blockers[]` and concrete
+examples. Legacy unsupported blockers get a bounded Stop-hook reassessment, not
+a background restart. Intentional pauses and real approval boundaries remain.
+Retry-budget exhaustion records a safety pause, not an external mission blocker.
+
 The Stop guard tracks its exact generated continuation prompt so its synthetic
 user prompt can retain task ownership across epochs. Any other new user prompt
 cancels the old recovery authority until the agent registers the current task.
