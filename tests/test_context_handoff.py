@@ -758,5 +758,180 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(settings['continuation_backend'],'desktop')
         self.assertTrue((new_home/'config.toml').is_file())
 
+    def test_ready_keeps_execution_cwd_and_permissions_when_native_project_move_is_rejected(self):
+        self.transcript_at(400000); m.hook(self.payload, self.root); self.checkpoint()
+        m.update_state(self.directory, permission_mode='default')
+        project = {'projectId': 'saved-project', 'hostId': 'local', 'path': str(self.cwd.parent)}
+        sid = self.sid
+        class ProjectDesktop(FakeDesktop):
+            def call(self, name, args):
+                self.calls.append((name, args))
+                if name == 'list_projects': return {'projects': [dict(project, projectKind='local')]}
+                if name == 'list_threads': return {'threads': [
+                    {'id': sid, 'kind': 'codex', 'hostId': 'local', 'projectId': 'saved-project'},
+                    {'id': 'successor-1', 'kind': 'codex', 'hostId': 'local', 'projectId': None}]}
+                if name == 'move_thread_to_project': raise RuntimeError('Source project cannot be safely determined')
+                raise AssertionError(name)
+        result = m.ready(self.root, self.sid, FakeServer, ProjectDesktop)
+        self.assertEqual(result['status'], 'successor_ready')
+        self.assertTrue(result['project_association']['manual_sidebar_move_required'])
+        params = next(args for name, args in FakeServer.calls if name == 'thread/start')
+        self.assertEqual(params['cwd'], str(self.cwd))
+        self.assertNotIn('sandbox', params)
+        self.assertNotIn('approvalPolicy', params)
+        self.assertNotIn('projectId', params)
+        successor = m.load_json(m.session_dir(self.root, 'successor-1')/'state.json')
+        self.assertEqual(successor['source_project'], project)
+        self.assertEqual(successor['cwd'], str(self.cwd))
+        m.ready(self.root, self.sid, FakeServer, ProjectDesktop)
+        self.assertEqual(sum(name == 'move_thread_to_project' for name, _ in FakeDesktop.calls), 1)
+
+    def test_installer_resolves_relative_paths_before_persisting_hook_commands(self):
+        home = self.base/'home'; home.mkdir(); (home/'config.toml').write_text('model = "preserved"\n')
+        rows = [{'key': event, 'eventName': event, 'enabled': True, 'currentHash': 'sha256:fixture'}
+                for event in installer.EVENTS]
+        with m.contextlib.chdir(self.base), patch.object(installer.shutil, 'which', return_value='/usr/bin/codex'), \
+                patch.object(installer, 'hook_rows', return_value=rows):
+            report = installer.install(Path('state'), homes=[home], library=Path('versions'),
+                                       entrypoint=Path('versions/entrypoint.py'))
+        self.assertTrue(Path(report['installed']).is_absolute())
+        self.assertTrue(Path(report['entrypoint']).is_absolute())
+        self.assertIn('--root ' + str(self.root), report['command'])
+
+
+    def test_queue_service_resolves_relative_root_executable_and_unit_directory(self):
+        with m.contextlib.chdir(self.base):
+            report = installer.install_queue_service(Path('state'), Path('loader.py'),
+                unit_directory=Path('units'), runner=lambda *args, **kwargs: None)
+        self.assertEqual(report['database'], str(self.root/'queue.sqlite3'))
+        unit = Path(report['unit']).read_text()
+        self.assertIn(str(self.base/'loader.py'), unit)
+        self.assertIn('--root ' + str(self.root), unit)
+
+
+
+
+class SidebarTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.config = {'enabled': True, 'queue': {'enabled': True}, 'autopin': {'enabled': True}}
+        m.atomic_json(self.root/'settings.json', self.config)
+        self.routing = {'config_home': '/config', 'caller_thread_id': 'genuine-caller', 'caller_turn_id': 'genuine-turn'}
+        m.atomic_json(self.root/'desktop-caller.json', self.routing)
+        self.environment = patch.dict(m.os.environ, {'CODEX_APP_TOOLS_PIPE_PATH': 'fixture-pipe'})
+        self.environment.start(); self.addCleanup(self.environment.stop)
+        self.calls = []
+        self.rows = [{'id': 'running', 'kind': 'codex', 'hostId': 'local', 'status': 'active'}]
+        self.pinned = []
+        self.run = 'run-1'
+        self.reject = False
+        self.projects = [{'projectId': 'project', 'projectKind': 'local', 'path': str(self.root/'project'), 'hostId': 'local'}]
+        outer = self
+        class Desktop:
+            def __init__(self, **kwargs): outer.calls.append(('connect', kwargs))
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def call(self, name, arguments):
+                outer.calls.append((name, arguments))
+                if name == 'list_projects': return {'projects': outer.projects}
+                if name == 'list_threads': return {'threads': outer.rows, 'pinnedThreads': outer.pinned}
+                if name == 'read_thread':
+                    return {'thread': {'status': {'type': 'active'}},
+                            'turns': [{'id': outer.run, 'status': 'inProgress'}]}
+                if name.startswith('move_'):
+                    if outer.reject: raise RuntimeError('Native safety rejection')
+                    if name == 'move_thread_to_project':
+                        next(row for row in outer.rows if row['id'] == arguments['threadId'])['projectId'] = arguments['projectId']
+                    return {'status': 'accepted'}
+                raise AssertionError(name)
+        self.desktop = Desktop
+
+    def pins(self):
+        return [args for name, args in self.calls if name == 'move_thread_to_sidebar_section']
+
+    def test_running_local_task_is_pinned_once_with_genuine_routing_and_never_sent_a_prompt(self):
+        m.pin_running_tasks(self.root, self.desktop)
+        m.pin_running_tasks(self.root, self.desktop)
+        self.assertEqual(self.pins(), [{'threadId': 'running', 'hostId': 'local', 'sectionId': 'pinned'}])
+        self.assertEqual(self.calls[0], ('connect', self.routing))
+        self.assertEqual(m.load_json(self.root/'autopin.json')['runs']['running']['status'], 'pinned')
+        self.assertEqual((self.root/'autopin.json').stat().st_mode & 0o777, 0o600)
+
+    def test_manual_pin_then_unpin_is_respected_until_a_new_run(self):
+        self.pinned = self.rows; self.rows = []
+        m.pin_running_tasks(self.root, self.desktop)
+        self.rows = self.pinned; self.pinned = []
+        m.pin_running_tasks(self.root, self.desktop)
+        self.assertFalse(self.pins())
+        self.run = 'run-2'; m.pin_running_tasks(self.root, self.desktop)
+        self.assertEqual(len(self.pins()), 1)
+
+    def test_uncertain_pin_receipt_is_not_replayed_after_restart(self):
+        self.reject = True
+        m.pin_running_tasks(self.root, self.desktop)
+        self.reject = False
+        m.pin_running_tasks(self.root, self.desktop)
+        self.assertEqual(len(self.pins()), 1)
+        self.assertEqual(m.load_json(self.root/'autopin.json')['runs']['running']['status'], 'failed_or_ambiguous')
+
+    def test_idle_remote_chatgpt_and_restricted_session_rows_are_not_pinned(self):
+        self.rows += [dict(self.rows[0], id='remote', hostId='remote'),
+                      dict(self.rows[0], id='idle', status='idle'), dict(self.rows[0], id='chat', kind='chatgpt')]
+        self.config['allowed_sessions'] = ['other']
+        m.atomic_json(self.root/'settings.json', self.config)
+        m.pin_running_tasks(self.root, self.desktop)
+        self.assertFalse(self.pins())
+        self.assertFalse(any(name == 'read_thread' for name, _ in self.calls))
+
+    def test_completed_latest_turn_is_not_a_running_task(self):
+        desktop = self.desktop
+        class Completed(desktop):
+            def call(self, name, args):
+                value = super().call(name, args)
+                if name == 'read_thread': value['turns'][0]['status'] = 'completed'
+                return value
+        m.pin_running_tasks(self.root, Completed)
+        self.assertFalse(self.pins())
+
+    def test_disabled_autopin_does_not_connect(self):
+        self.config['autopin']['enabled'] = False
+        m.atomic_json(self.root/'settings.json', self.config)
+        self.assertEqual(m.pin_running_tasks(self.root, self.desktop)['status'], 'disabled')
+        self.assertFalse(self.calls)
+
+    def test_current_native_membership_overrides_stale_saved_project(self):
+        self.rows[0]['projectId'] = 'project'
+        state = {'cwd': '/unrelated/worktree', 'source_project': {'projectId': 'stale'}}
+        value = m.source_project_context(self.root, 'running', state, self.desktop())
+        self.assertEqual(value['projectId'], 'project')
+
+    def test_nearest_ancestor_membership_is_inherited_without_changing_worktree(self):
+        self.rows += [dict(self.rows[0], id='parent', projectId='project')]
+        m.atomic_json(m.session_dir(self.root, 'parent')/'state.json', {'successor_id': 'running'})
+        state = {'cwd': '/different/execution/worktree'}
+        value = m.source_project_context(self.root, 'running', state, self.desktop())
+        self.assertEqual(value['projectId'], 'project')
+        self.assertEqual(state['cwd'], '/different/execution/worktree')
+
+    def test_unknown_nested_directory_is_not_guessed_as_project_membership(self):
+        state = {'cwd': str(self.root/'project/nested/worktree')}
+        self.assertIsNone(m.source_project_context(self.root, 'running', state, self.desktop()))
+
+    def test_exact_project_directory_fallback_is_host_scoped(self):
+        state = {'cwd': str(self.root/'project')}
+        self.assertEqual(m.source_project_context(self.root, 'running', state, self.desktop())['projectId'], 'project')
+        self.projects[0]['hostId'] = 'remote'
+        self.assertIsNone(m.source_project_context(self.root, 'running', state, self.desktop()))
+
+    def test_native_association_requires_independent_membership_readback(self):
+        state = {'session_id': 'genuine-caller', 'config_home': '/config', 'successor_id': 'running',
+                 'source_project': {'projectId': 'project'}}
+        self.assertEqual(m.inherit_project(self.root, state, self.desktop)['status'], 'verified')
+        self.reject = True
+        self.rows[0].pop('projectId')
+        with self.assertRaises(RuntimeError): m.inherit_project(self.root, state, self.desktop)
+
+
 
 if __name__=='__main__':unittest.main()

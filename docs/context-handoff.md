@@ -159,6 +159,40 @@ Checkpoints and original history are not automatically pruned. Review retained
 state as part of normal maintenance. Disabling the integration leaves all work
 and evidence intact.
 
+## Project membership and automatic pins
+
+Execution cwd and sidebar project membership are separate. Before creating a
+successor, the helper queries native `list_projects` and `list_threads` and
+retains the current or nearest known ancestor's local project as `source_project`.
+An exact saved project directory can also establish membership; a nested
+worktree alone cannot. The context is carried through handoff state without
+changing execution directories, sandbox roots, or permissions. After bootstrap,
+the helper attempts native `move_thread_to_project` once and reads membership
+back. An existing different membership is preserved.
+
+Native Desktop can reject an orphan worktree thread because its source project
+cannot be safely determined. In that case `project_association` records
+`manual_sidebar_move_required: true`; handoff can continue in the same worktree.
+Move that thread into the intended project using the app sidebar. The helper
+does not edit app databases, add folder access, or claim a rejected move worked.
+
+Use `python3 scripts/install_codex_context_handoff.py --enable-autopin` to opt in
+to pinning running local Codex tasks. This also enables the existing queue
+service. Every 15 seconds between recovery jobs, the worker reads recent and
+pinned tasks plus a rotating history page, then confirms the newest active turn
+through native `read_thread`. Remote, ChatGPT, idle and out-of-scope tasks are
+excluded. No model prompt is sent for pinning.
+
+The private `autopin.json` records a run before the native pin call. Existing
+manual pins are preserved, finished tasks are never automatically unpinned,
+and a manual unpin or lost receipt is not overridden again during the same
+observed run, including after worker restart. A new model turn is a new run.
+Disable this feature by setting `autopin.enabled` to false in settings; leave
+the queue enabled to retain recovery. Hook callbacks refresh the genuine caller
+and Desktop routing after reconnects. Pin failures remain in the ledger for
+inspection instead of causing repeated sidebar mutations.
+
+
 ## Verification
 
 ```sh

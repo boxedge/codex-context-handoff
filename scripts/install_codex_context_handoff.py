@@ -99,7 +99,8 @@ def compatibility_entrypoint(alias, installed, library, backups):
 
 def install_queue_service(root, executable, unit_directory=None, runner=None):
     runner = runner or subprocess.run
-    directory = Path(unit_directory or Path.home()/'.config/systemd/user')
+    root, executable = (Path(value).expanduser().resolve() for value in (root, executable))
+    directory = Path(unit_directory or Path.home()/'.config/systemd/user').expanduser().resolve()
     directory.mkdir(parents=True,exist_ok=True)
     path = directory/'codex-context-handoff-queue.service'
     marker = '# Managed by codex-context-handoff queue\n'
@@ -124,13 +125,13 @@ def install_queue_service(root, executable, unit_directory=None, runner=None):
 
 
 
-def install(root=DEFAULT_ROOT, homes=None, library=None, entrypoint=None, enable_queue=False):
-    root = Path(root)
+def install(root=DEFAULT_ROOT, homes=None, library=None, entrypoint=None, enable_queue=False, enable_autopin=False):
+    root = Path(root).expanduser().resolve()
     homes = tuple(dict.fromkeys(local_path(p).expanduser().resolve() for p in
                                 (homes if homes is not None else default_homes())))
     if not homes:
         raise ValueError('Select at least one Codex configuration home')
-    library = Path(library or Path.home()/'.local/lib/codex-context-handoff')
+    library = Path(library or Path.home()/'.local/lib/codex-context-handoff').expanduser().resolve()
     library.mkdir(parents=True, exist_ok=True, mode=0o700)
     source = Path(__file__).with_name('codex_context_handoff.py').read_bytes()
     digest = hashlib.sha256(source).hexdigest()
@@ -150,6 +151,7 @@ def install(root=DEFAULT_ROOT, homes=None, library=None, entrypoint=None, enable
                               'auto_continue':False, 'auto_open':False, 'continuation_backend':'desktop'})
     backups = root/'backups'/str(time.time_ns()); backups.mkdir(parents=True, mode=0o700)
     entrypoint = entrypoint or load_json(settings).get('hook_entrypoint') or library/'handoff-entrypoint.py'
+    entrypoint = Path(entrypoint).expanduser().resolve()
     executable = compatibility_entrypoint(entrypoint,installed,library,backups)
     configuration = load_json(settings)
     configuration['hook_entrypoint'] = str(executable)
@@ -181,7 +183,11 @@ def install(root=DEFAULT_ROOT, homes=None, library=None, entrypoint=None, enable
             raise ValueError('Handoff hooks are not enabled')
         report['homes'].append({'home':str(home),'hooks':[{key:row.get(key) for key in ('key','eventName','enabled','currentHash','status')} for row in verified],
                                 'model_settings_preserved':True})
-    if enable_queue or load_json(settings).get('queue',{}).get('enabled'):
+    if enable_autopin:
+        configured = load_json(settings)
+        configured['autopin'] = dict(configured.get('autopin', {}), enabled=True)
+        atomic_json(settings, configured)
+    if enable_queue or enable_autopin or load_json(settings).get('queue',{}).get('enabled'):
         report['queue'] = install_queue_service(root,executable)
     atomic_json(root/'installation.json',report)
     return report
@@ -195,5 +201,6 @@ if __name__ == '__main__':
                         help='Codex home to configure; repeat for multiple homes. Defaults to CODEX_HOME or ~/.codex.')
     parser.add_argument('--library',type=Path,help='Versioned helper directory (default: ~/.local/lib/codex-context-handoff)')
     parser.add_argument('--enable-queue',action='store_true')
+    parser.add_argument('--enable-autopin',action='store_true')
     args=parser.parse_args()
-    print(json.dumps(install(args.root,homes=args.homes,library=args.library,entrypoint=args.entrypoint,enable_queue=args.enable_queue),indent=2))
+    print(json.dumps(install(args.root,homes=args.homes,library=args.library,entrypoint=args.entrypoint,enable_queue=args.enable_queue,enable_autopin=args.enable_autopin),indent=2))

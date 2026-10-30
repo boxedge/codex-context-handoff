@@ -138,5 +138,16 @@ class RecoveryQueueTests(unittest.TestCase):
         self.assertNotIn('GITHUB_TOKEN',env)
         self.assertNotIn('OPENAI_API_KEY',env)
 
+    def test_duplicate_enqueue_preserves_capacity_deadline_and_retry_turn(self):
+        self.enqueue(kind='task')
+        h.run_queue_once(self.root, handler=lambda job: {'status': 'capacity_backoff',
+                         'turn_id': 'failed-turn', 'delay': 30}, now=100)
+        self.queue.enqueue('task', 'source', 1, {'caller_thread_id': 'new-caller'}, now=110)
+        self.assertIsNone(self.queue.claim(now=129))
+        job = self.queue.claim(now=130)
+        self.assertEqual(job['payload']['capacity_ready_turn'], 'failed-turn')
+        self.assertEqual(job['payload']['caller_thread_id'], 'new-caller')
+
+
 
 if __name__=='__main__':unittest.main()

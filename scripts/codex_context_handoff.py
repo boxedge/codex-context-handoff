@@ -54,11 +54,75 @@ def queue_enabled(config):
     return bool(config.get('enabled') and config.get('queue', {}).get('enabled'))
 
 
+def autopin_enabled(config):
+    return bool(queue_enabled(config) and config.get('autopin', {}).get('enabled'))
+
+
 def capture_queue_environment(root):
     # Desktop routing only. Never persist account tokens or arbitrary environment.
     if os.environ.get('CODEX_APP_TOOLS_PIPE_PATH'):
         names = ('CODEX_APP_TOOLS_PIPE_PATH', 'WSL_INTEROP', 'WSLENV', 'PATH')
         atomic_json(Path(root)/'queue-environment.json', {key: os.environ[key] for key in names if key in os.environ})
+
+
+def pin_running_tasks(root, desktop_factory=None):
+    """One native pin attempt per observed run; never unpin or replay an uncertain pin."""
+    root = Path(root)
+    if not autopin_enabled(load_json(root/'settings.json', {})):
+        return {'status': 'disabled'}
+    routing = load_json(root/'desktop-caller.json', {})
+    if not routing.get('caller_thread_id') or not os.environ.get('CODEX_APP_TOOLS_PIPE_PATH'):
+        return {'status': 'observer_unavailable'}
+    with locked(root, 'autopin.lock', blocking=False):
+        ledger = load_json(root/'autopin.json', {'runs': {}})
+        with (desktop_factory or DesktopTools)(**routing) as desktop:
+            recent = desktop.call('list_threads', {'limit': 50})
+            history_args = {'mode': 'history', 'source': 'codex', 'hostId': 'local', 'limit': 50}
+            if ledger.get('cursor'):
+                history_args['cursor'] = ledger['cursor']
+            try:
+                history = desktop.call('list_threads', history_args)
+            except Exception:
+                # A stale cursor must not prevent recent active tasks from being pinned.
+                history = {}
+            ledger['cursor'] = history.get('nextCursor')
+            pinned = {row['id'] for row in recent.get('pinnedThreads', []) if row.get('kind') == 'codex'
+                      and row.get('hostId') == 'local'}
+            rows = {row['id']: row for row in history.get('threads', [])}
+            rows.update({row['id']: row for row in recent.get('threads', []) + recent.get('pinnedThreads', [])})
+            for sid, row in rows.items():
+                config = load_json(root/'settings.json', {})
+                if not autopin_enabled(config):
+                    break
+                if (row.get('kind') != 'codex' or row.get('hostId') != 'local' or row.get('status') != 'active'
+                        or (config.get('allowed_sessions') and sid not in config['allowed_sessions'])):
+                    continue
+                snapshot = desktop.call('read_thread', {'threadId': sid, 'hostId': 'local', 'turnLimit': 1,
+                    'includeOutputs': False, 'maxOutputCharsPerItem': 0})
+                turns = snapshot.get('turns', [])
+                if (snapshot.get('thread', {}).get('status', {}).get('type') != 'active' or not turns
+                        or turns[0].get('status') not in ('inProgress', 'in_progress') or not turns[0].get('id')):
+                    continue
+                run = turns[0]['id']
+                if ledger['runs'].get(sid, {}).get('turn_id') == run:
+                    continue
+                config = load_json(root/'settings.json', {})
+                if not autopin_enabled(config) or (config.get('allowed_sessions') and sid not in config['allowed_sessions']):
+                    continue
+                entry = {'turn_id': run, 'status': 'already_pinned' if sid in pinned else 'pinning',
+                         'updated_at': time.time()}
+                ledger['runs'][sid] = entry
+                atomic_json(root/'autopin.json', ledger)
+                if sid not in pinned:
+                    try:
+                        desktop.call('move_thread_to_sidebar_section',
+                                     {'threadId': sid, 'hostId': 'local', 'sectionId': 'pinned'})
+                        entry['status'] = 'pinned'
+                    except Exception:
+                        entry['status'] = 'failed_or_ambiguous'
+                    atomic_json(root/'autopin.json', ledger)
+            atomic_json(root/'autopin.json', ledger)
+        return {'status': 'observed', 'runs': len(ledger['runs'])}
 
 
 class RecoveryQueue:
@@ -94,9 +158,16 @@ class RecoveryQueue:
         now = time.time() if now is None else now
         key = f'{kind}:{sid}:{int(epoch)}'
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            previous = db.execute('SELECT payload FROM jobs WHERE job_key=?', (key,)).fetchone()
+            saved = json.loads(previous['payload']) if previous else {}
+            merged = dict(saved, **(payload or {}))
+            if 'capacity_ready_turn' in saved:
+                merged['capacity_ready_turn'] = saved['capacity_ready_turn']
             db.execute('''INSERT INTO jobs(job_key,kind,session_id,epoch,payload,status,due,updated)
                 VALUES(?,?,?,?,?,'pending',?,?) ON CONFLICT(job_key) DO UPDATE SET payload=excluded.payload
-                WHERE jobs.status='pending' ''', (key,kind,sid,epoch,json.dumps(payload or {}),now,now))
+                WHERE jobs.status='pending' ''', (key,kind,sid,epoch,json.dumps(merged),now,now))
+            db.commit()
         return key
 
     def claim(self, now=None, lease_seconds=120):
@@ -213,11 +284,18 @@ def queue_worker(root):
     root = Path(root);root.mkdir(parents=True,exist_ok=True,mode=0o700)
     with locked(root,'queue-worker.lock',blocking=False):
         reported = set()
+        next_pin = 0
         while queue_enabled(load_json(root/'settings.json',{})):
             environment = load_json(root/'queue-environment.json',{})
             for key in ('CODEX_APP_TOOLS_PIPE_PATH','WSL_INTEROP','WSLENV','PATH'):
                 if key in environment:
                     os.environ[key] = environment[key]
+            if time.monotonic() >= next_pin:
+                try:
+                    pin_running_tasks(root)
+                except Exception as exc:
+                    print(json.dumps({'autopin': 'observer_error', 'reason': type(exc).__name__}), flush=True)
+                next_pin = time.monotonic() + 15
             worked = run_queue_once(root)
             for row in RecoveryQueue(root).rows():
                 marker = (row['job_key'],row['updated'])
@@ -568,6 +646,10 @@ def hook(payload, root):
         output['systemMessage'] += ' Automatic dispatch is pending or requires inspection; see handoff status.'
     if watch_due:
         schedule_task_watch(root, sid)
+    if os.environ.get('CODEX_APP_TOOLS_PIPE_PATH'):
+        capture_queue_environment(root)
+        atomic_json(Path(root)/'desktop-caller.json', {'config_home': state['config_home'],
+                    'caller_thread_id': sid, 'caller_turn_id': payload.get('turn_id') or state.get('last_prompt_turn_id')})
     return output
 
 
@@ -1017,7 +1099,63 @@ def lineage_header(lineage):
     return links + '\n\n'
 
 
-def ready(root, sid, server_factory=None):
+def source_project_context(root, sid, state, desktop):
+    """Resolve frontend project membership independently of the execution cwd."""
+    projects = {row['projectId']: row for row in desktop.call('list_projects', {}).get('projects', [])
+                if row.get('projectKind') == 'local' and row.get('hostId') == 'local' and row.get('path')}
+    listing = desktop.call('list_threads', {'limit': 50})
+    rows = {row['id']: row for row in listing.get('threads', []) + listing.get('pinnedThreads', [])
+            if row.get('kind') == 'codex' and row.get('hostId') == 'local'}
+    states = {p.parent.name: load_json(p, {}) for p in (Path(root)/'sessions').glob('*/state.json')}
+    parents = {}
+    for ident, saved in states.items():
+        target = saved.get('successor_id')
+        if target:
+            if target in parents and parents[target] != ident:
+                raise ValueError('Ambiguous project ancestry')
+            parents[target] = ident
+    ident, seen = sid, set()
+    while ident and ident not in seen:
+        seen.add(ident)
+        saved = state if ident == sid else states.get(ident, {})
+        project_id = rows.get(ident, {}).get('projectId')
+        project_id = project_id or saved.get('source_project', {}).get('projectId')
+        if project_id in projects:
+            project = projects[project_id]
+            return {key: project[key] for key in ('projectId', 'path', 'hostId')}
+        ident = parents.get(ident) or saved.get('previous_thread_id')
+    # Only an exact saved project directory is evidence; never guess from a nested worktree.
+    matches = [p for p in projects.values() if local_path(p['path']).resolve() == Path(state['cwd']).resolve()]
+    if len(matches) == 1:
+        return {key: matches[0][key] for key in ('projectId', 'path', 'hostId')}
+    return None
+
+
+def inherit_project(root, state, desktop_factory=None):
+    """Use only supported metadata tools, retaining worktree and sandbox on rejection."""
+    with (desktop_factory or DesktopTools)(config_home=state['config_home'],
+            caller_thread_id=state['session_id'], caller_turn_id=state.get('last_prompt_turn_id')) as desktop:
+        listing = desktop.call('list_threads', {'limit': 50})
+        row = next((row for row in listing.get('threads', []) + listing.get('pinnedThreads', [])
+                    if row.get('id') == state['successor_id'] and row.get('kind') == 'codex'
+                    and row.get('hostId') == 'local'), None)
+        if row is None:
+            return {'status': 'not_visible', 'manual_sidebar_move_required': True}
+        project_id = state['source_project']['projectId']
+        if row.get('projectId') and row['projectId'] != project_id:
+            return {'status': 'membership_changed', 'manual_sidebar_move_required': True}
+        if row.get('projectId') != project_id:
+            desktop.call('move_thread_to_project', {'threadId': state['successor_id'],
+                         'hostId': 'local', 'projectId': project_id})
+            listing = desktop.call('list_threads', {'limit': 50})
+            row = next((row for row in listing.get('threads', []) + listing.get('pinnedThreads', [])
+                        if row.get('id') == state['successor_id'] and row.get('hostId') == 'local'), {})
+        verified = row.get('projectId') == project_id
+        return {'status': 'verified' if verified else 'unverified',
+                'projectId': project_id, 'manual_sidebar_move_required': not verified}
+
+
+def ready(root, sid, server_factory=None, desktop_factory=None):
     config = load_json(Path(root) / 'settings.json', {})
     directory = session_dir(root, sid)
     with locked(directory, 'creation.lock', blocking=False):
@@ -1047,6 +1185,17 @@ def ready(root, sid, server_factory=None):
         factory = server_factory or AppServer
         env = os.environ.copy()
         env['CODEX_HOME'] = state['config_home']
+        use_desktop = desktop_factory is not None or (server_factory is None and os.environ.get('CODEX_APP_TOOLS_PIPE_PATH'))
+        if use_desktop and not state.get('successor_id'):
+            try:
+                with (desktop_factory or DesktopTools)(config_home=state['config_home'],
+                        caller_thread_id=sid, caller_turn_id=state.get('last_prompt_turn_id')) as desktop:
+                    project = source_project_context(root, sid, state, desktop)
+                if project:
+                    state['source_project'] = project
+                    update_state(directory, source_project=project)
+            except Exception as exc:
+                update_state(directory, project_resolution={'status': 'unavailable', 'reason': type(exc).__name__})
         with factory(binary=config.get('codex_binary'), env=env) as server:
             if not state.get('successor_id'):
                 source = server.rpc('thread/read', {'threadId': sid, 'includeTurns': False})['thread']
@@ -1054,8 +1203,6 @@ def ready(root, sid, server_factory=None):
                     server.rpc('thread/read', {'threadId': ident, 'includeTurns': False})['thread'])
                 params = {'cwd': state['cwd'], 'model': state.get('model'),
                           'ephemeral': False, 'serviceName': 'context-handoff'}
-                if source.get('projectId'):
-                    params['projectId'] = source['projectId']
                 # Preserve a runtime-reported full-access mode, never infer authority from checkpoint text.
                 if state.get('permission_mode') == 'bypassPermissions':
                     params.update(sandbox='danger-full-access', approvalPolicy='never')
@@ -1079,6 +1226,8 @@ def ready(root, sid, server_factory=None):
                     successor_state['handoff_initializing'] = True
                     successor_state.setdefault('config_home', state['config_home'])
                     successor_state.setdefault('cwd', state['cwd'])
+                    if state.get('source_project'):
+                        successor_state['source_project'] = state['source_project']
                     atomic_json(successor_directory/'state.json', successor_state)
             else:
                 server.rpc('thread/resume', {'threadId': state['successor_id']})
@@ -1117,6 +1266,19 @@ def ready(root, sid, server_factory=None):
             visible = server.rpc('thread/list', {'limit': 100, 'sortKey': 'updated_at'})['data']
             if not any(row['id'] == state['successor_id'] for row in visible):
                 raise RuntimeError('Successor was initialized but is not listed; source chat retained')
+        if (use_desktop and state.get('source_project') and
+                state.get('project_association', {}).get('threadId') != state['successor_id']):
+            # Persist intent first: an uncertain metadata result is not retried automatically.
+            association = {'status': 'attempting', 'threadId': state['successor_id'], 'manual_sidebar_move_required': True}
+            update_state(directory, project_association=association)
+            try:
+                association = inherit_project(root, state, desktop_factory)
+            except Exception as exc:
+                association = {'status': 'native_rejected_or_unavailable', 'reason': type(exc).__name__,
+                               'manual_sidebar_move_required': True}
+            association['threadId'] = state['successor_id']
+            update_state(directory, project_association=association)
+            update_state(session_dir(root, state['successor_id']), project_association=association)
         successor_state = load_json(session_dir(root, state['successor_id'])/'state.json', {})
         successor_marker = {key: successor_state.get(key) for key in
                             ('prompt_epoch', 'last_prompt_turn_id', 'last_user_marker')}
@@ -1137,6 +1299,7 @@ def ready(root, sid, server_factory=None):
                     (not config.get('allowed_sessions') or sid in config['allowed_sessions'])) else False
         return {'status': 'successor_ready', 'successor_id': state['successor_id'], 'successor_title': state['successor_title'],
                 'handoff_sha256': digest, 'source_preserved': True, 'workspace': state['cwd'],
+                'project_association': load_json(directory/'state.json').get('project_association'),
                 'automatic_continuation_scheduled': automatic,
                 'initialization': ('Checkpoint loaded; automatic continuation waits for this source turn to stop.' if automatic
                                    else 'Checkpoint loaded; awaiting user continuation. Desktop focus is not changed.')}
