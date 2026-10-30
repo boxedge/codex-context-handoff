@@ -166,15 +166,31 @@ successor, the helper queries native `list_projects` and `list_threads` and
 retains the current or nearest known ancestor's local project as `source_project`.
 An exact saved project directory can also establish membership; a nested
 worktree alone cannot. The context is carried through handoff state without
-changing execution directories, sandbox roots, or permissions. After bootstrap,
-the helper attempts native `move_thread_to_project` once and reads membership
-back. An existing different membership is preserved.
+changing execution directories, sandbox roots, or permissions. The helper
+validates the identity and roots through the app-server's `project/read`, then
+passes `projectId` to `thread/start`. A source thread's persisted project identity
+also supplies context when native sidebar discovery is unavailable.
 
-Native Desktop can reject an orphan worktree thread because its source project
-cannot be safely determined. In that case `project_association` records
-`manual_sidebar_move_required: true`; handoff can continue in the same worktree.
-Move that thread into the intended project using the app sidebar. The helper
-does not edit app databases, add folder access, or claim a rejected move worked.
+For full-access local sources, native `create_thread` also establishes the
+Desktop sidebar assignment. Its first turn only loads and confirms the checkpoint.
+After that bootstrap completes and its exact JSON is verified, the helper briefly
+archives this idle successor through native tools, restores its original execution
+cwd through the supported app-server settings API, and unarchives it natively.
+The source task is never archived, resumed or interrupted. The successor's native
+project and cwd must both match before handoff becomes ready. Creation intent is
+saved before the native call so a missing receipt cannot create duplicate tasks.
+Restricted sources keep their existing creation policy; native default permissions
+are never substituted to obtain sidebar membership. Bootstrap timeouts retain
+Desktop ownership without sending an interrupt.
+
+Existing orphan continuations can use the supported `thread/metadata/update`
+API with only `threadId` and `projectId`. The helper independently reads both
+persisted metadata and native `list_threads` membership before reporting success.
+This does not resume or interrupt a model turn, change cwd, send a prompt, or
+change workspace access. Existing different memberships are preserved.
+The frontend move tool's source-folder inference is not needed for this metadata
+assignment. A rejected or unavailable API is recorded rather than treated as a
+successful association; no direct app database edits are used.
 
 Use `python3 scripts/install_codex_context_handoff.py --enable-autopin` to opt in
 to pinning running local Codex tasks. This also enables the existing queue

@@ -758,33 +758,81 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(settings['continuation_backend'],'desktop')
         self.assertTrue((new_home/'config.toml').is_file())
 
-    def test_ready_keeps_execution_cwd_and_permissions_when_native_project_move_is_rejected(self):
+    def test_ready_assigns_native_project_at_creation_without_changing_cwd_or_permissions(self):
         self.transcript_at(400000); m.hook(self.payload, self.root); self.checkpoint()
         m.update_state(self.directory, permission_mode='default')
         project = {'projectId': 'saved-project', 'hostId': 'local', 'path': str(self.cwd.parent)}
         sid = self.sid
+        class ProjectServer(FakeServer):
+            def rpc(self, method, args, **kwargs):
+                if method == 'project/read':
+                    return {'project': {'id': 'saved-project', 'roots': [{'path': project['path']}]}}
+                return super().rpc(method, args, **kwargs)
         class ProjectDesktop(FakeDesktop):
             def call(self, name, args):
                 self.calls.append((name, args))
                 if name == 'list_projects': return {'projects': [dict(project, projectKind='local')]}
                 if name == 'list_threads': return {'threads': [
                     {'id': sid, 'kind': 'codex', 'hostId': 'local', 'projectId': 'saved-project'},
-                    {'id': 'successor-1', 'kind': 'codex', 'hostId': 'local', 'projectId': None}]}
-                if name == 'move_thread_to_project': raise RuntimeError('Source project cannot be safely determined')
+                    {'id': 'successor-1', 'kind': 'codex', 'hostId': 'local', 'projectId': 'saved-project'}]}
                 raise AssertionError(name)
-        result = m.ready(self.root, self.sid, FakeServer, ProjectDesktop)
+        result = m.ready(self.root, self.sid, ProjectServer, ProjectDesktop)
         self.assertEqual(result['status'], 'successor_ready')
-        self.assertTrue(result['project_association']['manual_sidebar_move_required'])
+        self.assertEqual(result['project_association']['status'], 'verified')
         params = next(args for name, args in FakeServer.calls if name == 'thread/start')
         self.assertEqual(params['cwd'], str(self.cwd))
         self.assertNotIn('sandbox', params)
         self.assertNotIn('approvalPolicy', params)
-        self.assertNotIn('projectId', params)
+        self.assertEqual(params['projectId'], 'saved-project')
         successor = m.load_json(m.session_dir(self.root, 'successor-1')/'state.json')
         self.assertEqual(successor['source_project'], project)
         self.assertEqual(successor['cwd'], str(self.cwd))
-        m.ready(self.root, self.sid, FakeServer, ProjectDesktop)
-        self.assertEqual(sum(name == 'move_thread_to_project' for name, _ in FakeDesktop.calls), 1)
+        m.ready(self.root, self.sid, ProjectServer, ProjectDesktop)
+        self.assertFalse(any(name == 'move_thread_to_project' for name, _ in FakeDesktop.calls))
+
+    def test_ready_uses_persisted_source_project_without_sidebar_discovery(self):
+        self.transcript_at(400000); m.hook(self.payload, self.root); self.checkpoint()
+        sid, cwd = self.sid, str(self.cwd)
+        class ProjectServer(FakeServer):
+            def rpc(self, method, args, **kwargs):
+                if method == 'project/read':
+                    return {'project': {'id': 'source-project', 'roots': [{'path': cwd}]}}
+                if method == 'thread/read' and args['threadId'] == sid:
+                    return {'thread': {'projectId': 'source-project', 'turns': []}}
+                return super().rpc(method, args, **kwargs)
+        m.ready(self.root, self.sid, ProjectServer)
+        params = next(args for name, args in FakeServer.calls if name == 'thread/start')
+        self.assertEqual(params['projectId'], 'source-project')
+        self.assertEqual(params['cwd'], cwd)
+
+    def test_ready_stops_before_creation_when_saved_project_root_changed(self):
+        self.transcript_at(400000); m.hook(self.payload, self.root); self.checkpoint()
+        m.update_state(self.directory, source_project={'projectId': 'source-project', 'hostId': 'local', 'path': '/old/root'})
+        class ProjectServer(FakeServer):
+            def rpc(self, method, args, **kwargs):
+                if method == 'project/read':
+                    return {'project': {'id': 'source-project', 'roots': [{'path': '/new/root'}]}}
+                return super().rpc(method, args, **kwargs)
+        with self.assertRaisesRegex(ValueError, 'roots changed'):
+            m.ready(self.root, self.sid, ProjectServer)
+        self.assertFalse(any(name == 'thread/start' for name, _ in FakeServer.calls))
+
+    def test_native_receipt_retry_reconciles_missing_successor_state_without_another_creation(self):
+        self.transcript_at(400000); m.hook(self.payload, self.root); self.checkpoint()
+        m.update_state(self.directory, successor_id='successor-1', successor_title='Part 2 · task',
+                       permission_mode='bypassPermissions', successor_creation={'backend': 'native', 'status': 'prepared'})
+        class ConfirmedServer(FakeServer):
+            def rpc(self, method, args, **kwargs):
+                if method == 'thread/read' and args['threadId'] == 'successor-1':
+                    return {'thread': {'turns': [{'id': 'bootstrap', 'status': 'completed',
+                        'items': [{'type': 'agentMessage', 'text': json.dumps(FakeServer.answer)}]}]}}
+                return super().rpc(method, args, **kwargs)
+        result = m.ready(self.root, self.sid, ConfirmedServer)
+        self.assertEqual(result['status'], 'successor_ready')
+        child = m.load_json(m.session_dir(self.root, 'successor-1')/'state.json')
+        self.assertEqual(child['previous_thread_id'], self.sid)
+        self.assertEqual(child['part'], 2)
+        self.assertFalse(any(name in ('thread/start', 'thread/resume', 'seed') for name, _ in FakeServer.calls))
 
     def test_installer_resolves_relative_paths_before_persisting_hook_commands(self):
         home = self.base/'home'; home.mkdir(); (home/'config.toml').write_text('model = "preserved"\n')
@@ -827,6 +875,8 @@ class SidebarTests(unittest.TestCase):
         self.run = 'run-1'
         self.reject = False
         self.projects = [{'projectId': 'project', 'projectKind': 'local', 'path': str(self.root/'project'), 'hostId': 'local'}]
+        self.backend_project = None
+        self.native_readback = True
         outer = self
         class Desktop:
             def __init__(self, **kwargs): outer.calls.append(('connect', kwargs))
@@ -846,6 +896,24 @@ class SidebarTests(unittest.TestCase):
                     return {'status': 'accepted'}
                 raise AssertionError(name)
         self.desktop = Desktop
+        class Server:
+            def __init__(self, **kwargs): pass
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def rpc(self, method, args):
+                outer.calls.append((method, args))
+                if method == 'project/read':
+                    return {'project': {'id': 'project', 'roots': [{'path': outer.projects[0]['path']}]}}
+                if method == 'thread/read':
+                    return {'thread': {'id': 'running', 'projectId': outer.backend_project, 'cwd': '/existing/worktree'}}
+                if method == 'thread/metadata/update':
+                    if outer.reject: raise RuntimeError('Synthetic lost metadata receipt')
+                    outer.backend_project = args['projectId']
+                    if outer.native_readback:
+                        next(row for row in outer.rows if row['id'] == args['threadId'])['projectId'] = args['projectId']
+                    return {}
+                raise AssertionError(method)
+        self.server = Server
 
     def pins(self):
         return [args for name, args in self.calls if name == 'move_thread_to_sidebar_section']
@@ -926,11 +994,95 @@ class SidebarTests(unittest.TestCase):
 
     def test_native_association_requires_independent_membership_readback(self):
         state = {'session_id': 'genuine-caller', 'config_home': '/config', 'successor_id': 'running',
-                 'source_project': {'projectId': 'project'}}
-        self.assertEqual(m.inherit_project(self.root, state, self.desktop)['status'], 'verified')
+                 'source_project': self.projects[0]}
+        self.assertEqual(m.inherit_project(self.root, state, self.desktop, self.server)['status'], 'verified')
+        writes = [(name, args) for name, args in self.calls if name == 'thread/metadata/update']
+        self.assertEqual(writes, [('thread/metadata/update', {'threadId': 'running', 'projectId': 'project'})])
+        self.assertFalse(any(name in ('thread/resume', 'turn/start', 'turn/interrupt', 'move_thread_to_project')
+                             for name, _ in self.calls))
         self.reject = True
+        self.backend_project = None
         self.rows[0].pop('projectId')
-        with self.assertRaises(RuntimeError): m.inherit_project(self.root, state, self.desktop)
+        with self.assertRaises(RuntimeError): m.inherit_project(self.root, state, self.desktop, self.server)
+
+    def test_backend_assignment_without_native_readback_is_not_claimed_as_verified(self):
+        state = {'session_id': 'genuine-caller', 'config_home': '/config', 'successor_id': 'running',
+                 'source_project': self.projects[0]}
+        self.native_readback = False
+        outcome = m.inherit_project(self.root, state, self.desktop, self.server)
+        self.assertEqual(outcome['status'], 'unverified')
+        self.assertEqual(self.backend_project, 'project')
+
+    def test_existing_backend_membership_is_preserved_without_a_metadata_write(self):
+        state = {'session_id': 'genuine-caller', 'config_home': '/config', 'successor_id': 'running',
+                 'source_project': self.projects[0]}
+        self.backend_project = 'manually-selected-other-project'
+        outcome = m.inherit_project(self.root, state, self.desktop, self.server)
+        self.assertEqual(outcome['status'], 'membership_changed')
+        self.assertFalse(any(name == 'thread/metadata/update' for name, _ in self.calls))
+
+    def test_changed_or_remote_project_roots_cannot_be_used_for_metadata_repair(self):
+        context = dict(self.projects[0], path='/different/project')
+        with self.assertRaisesRegex(ValueError, 'roots changed'):
+            m.validate_server_project(self.server(), context)
+        context['hostId'] = 'remote'
+        with self.assertRaisesRegex(ValueError, 'local project'):
+            m.validate_server_project(self.server(), context)
+
+    def test_saved_project_root_change_is_detected_before_catalog_replacement(self):
+        self.rows[0]['projectId'] = 'project'
+        state = {'cwd': '/existing/worktree', 'source_project': dict(self.projects[0], path='/old/project/root')}
+        with self.assertRaisesRegex(ValueError, 'roots changed'):
+            m.source_project_context(self.root, 'running', state, self.desktop())
+
+    def native_state(self):
+        state = {'session_id': 'genuine-caller', 'last_prompt_turn_id': 'genuine-turn', 'config_home': '/config',
+                 'prompt_epoch': 1, 'permission_mode': 'bypassPermissions', 'source_project': self.projects[0],
+                 'cwd': '/existing/worktree', 'transcript_path': '/original/transcript.jsonl',
+                 'successor_title': 'Part 2 · Original task'}
+        m.atomic_json(m.session_dir(self.root, state['session_id'])/'state.json', state)
+        return state
+
+    def test_uncertain_native_creation_is_not_replayed(self):
+        state = self.native_state()
+        desktop = self.desktop
+        class LostReceipt(desktop):
+            def call(self, name, args):
+                if name == 'create_thread':
+                    self_outer.calls.append((name, args))
+                    raise RuntimeError('Lost creation receipt')
+                return super().call(name, args)
+        self_outer = self
+        with self.assertRaises(RuntimeError): m.native_create_successor(self.root, state, '/snapshot.json', LostReceipt)
+        persisted = m.load_json(self.root/'sessions/genuine-caller/state.json')
+        with self.assertRaisesRegex(ValueError, 'uncertain'):
+            m.native_create_successor(self.root, persisted, '/snapshot.json', LostReceipt)
+        self.assertEqual(sum(name == 'create_thread' for name, _ in self.calls), 1)
+
+    def test_restricted_source_cannot_use_native_default_permission_bootstrap(self):
+        state = self.native_state(); state['permission_mode'] = 'default'
+        with self.assertRaisesRegex(ValueError, 'restricted'):
+            m.native_create_successor(self.root, state, '/snapshot.json', self.desktop)
+        self.assertFalse(self.calls)
+
+    def test_native_bootstrap_timeout_never_interrupts_or_archives_a_running_turn(self):
+        state = self.native_state(); state['successor_id'] = 'running'
+        state['successor_creation'] = {'backend': 'native', 'status': 'bootstrap'}
+        m.atomic_json(self.root/'sessions/genuine-caller/state.json', state)
+        with patch.object(m.time, 'monotonic', side_effect=[0, 1000]):
+            with self.assertRaises(TimeoutError):
+                m.prepare_native_successor(self.root, state, {}, self.server(), self.desktop)
+        self.assertFalse(any(name in ('set_thread_archived', 'turn/interrupt', 'thread/resume') for name, _ in self.calls))
+
+    def test_uncertain_native_transfer_is_not_replayed_or_allowed_to_archive_new_work(self):
+        for stage in ('transferring', 'restoring'):
+            with self.subTest(stage=stage):
+                state = self.native_state(); state['successor_id'] = 'running'
+                state['successor_creation'] = {'backend': 'native', 'status': stage}
+                m.atomic_json(self.root/'sessions/genuine-caller/state.json', state)
+                with self.assertRaisesRegex(ValueError, 'uncertain'):
+                    m.prepare_native_successor(self.root, state, {}, self.server(), self.desktop)
+                self.assertFalse(self.calls)
 
 
 
